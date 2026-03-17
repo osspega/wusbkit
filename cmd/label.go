@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/lazaroagomez/wusbkit/internal/output"
@@ -17,8 +18,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const (
+	labelMaxRetries = 3
+	labelRetryDelay = 500 * time.Millisecond
+)
+
 // setVolumeLabel sets the volume label using the native Windows API.
-// This is a direct Win32 call — no PowerShell overhead.
+// Retries up to 3 times with 500ms delay to handle transient USB errors.
 func setVolumeLabel(driveLetter, label string) error {
 	rootPath := driveLetter + ":\\"
 	rootPtr, err := syscall.UTF16PtrFromString(rootPath)
@@ -29,11 +35,18 @@ func setVolumeLabel(driveLetter, label string) error {
 	if err != nil {
 		return fmt.Errorf("invalid label: %w", err)
 	}
-	err = setVolumeLabelW(rootPtr, labelPtr)
-	if err != nil {
-		return fmt.Errorf("SetVolumeLabelW failed: %w", err)
+
+	var lastErr error
+	for attempt := 0; attempt < labelMaxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(labelRetryDelay)
+		}
+		lastErr = setVolumeLabelW(rootPtr, labelPtr)
+		if lastErr == nil {
+			return nil
+		}
 	}
-	return nil
+	return fmt.Errorf("SetVolumeLabelW failed after %d attempts: %w", labelMaxRetries, lastErr)
 }
 
 var procSetVolumeLabelW = syscall.NewLazyDLL("kernel32.dll").NewProc("SetVolumeLabelW")

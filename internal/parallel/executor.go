@@ -19,7 +19,14 @@ import (
 
 var procSetVolumeLabelW = syscall.NewLazyDLL("kernel32.dll").NewProc("SetVolumeLabelW")
 
+const (
+	labelMaxRetries = 3
+	labelRetryDelay = 500 * time.Millisecond
+)
+
 // setVolumeLabel sets the volume label using the native Windows API.
+// Retries up to 3 times with 500ms delay to handle USB bus contention
+// when labeling multiple drives on the same controller.
 func setVolumeLabel(driveLetter, label string) error {
 	rootPath := driveLetter + ":\\"
 	rootPtr, err := syscall.UTF16PtrFromString(rootPath)
@@ -30,14 +37,22 @@ func setVolumeLabel(driveLetter, label string) error {
 	if err != nil {
 		return fmt.Errorf("invalid label: %w", err)
 	}
-	r1, _, callErr := procSetVolumeLabelW.Call(
-		uintptr(unsafe.Pointer(rootPtr)),
-		uintptr(unsafe.Pointer(labelPtr)),
-	)
-	if r1 == 0 {
-		return fmt.Errorf("SetVolumeLabelW failed: %w", callErr)
+
+	var lastErr error
+	for attempt := 0; attempt < labelMaxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(labelRetryDelay)
+		}
+		r1, _, callErr := procSetVolumeLabelW.Call(
+			uintptr(unsafe.Pointer(rootPtr)),
+			uintptr(unsafe.Pointer(labelPtr)),
+		)
+		if r1 != 0 {
+			return nil
+		}
+		lastErr = callErr
 	}
-	return nil
+	return fmt.Errorf("SetVolumeLabelW failed after %d attempts: %w", labelMaxRetries, lastErr)
 }
 
 // LabelOptions contains options for labeling drives
@@ -403,15 +418,33 @@ func (e *Executor) FlashAll(ctx context.Context, disks []int, opts flash.Options
 	return batch
 }
 
-// LabelAll labels multiple drives in parallel
+// labelStaggerDelay is the delay between starting label operations on different
+// drives. This prevents USB bus contention when multiple drives share a controller.
+const labelStaggerDelay = 200 * time.Millisecond
+
+// LabelAll labels multiple drives with controlled concurrency.
+// Uses a max concurrency of 2 by default for label operations to avoid
+// USB bus contention timeouts, with a stagger delay between starts.
 func (e *Executor) LabelAll(ctx context.Context, driveLetters []string, opts LabelOptions) BatchResult {
-	sem := make(chan struct{}, e.maxConcurrent)
+	// Cap label concurrency at 2 unless user explicitly set higher
+	maxConc := e.maxConcurrent
+	if maxConc > 2 {
+		maxConc = 2
+	}
+
+	sem := make(chan struct{}, maxConc)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	results := make([]OperationResult, len(driveLetters))
 
 	for i, dl := range driveLetters {
 		wg.Add(1)
+
+		// Stagger starts to avoid hitting the USB controller simultaneously
+		if i > 0 {
+			time.Sleep(labelStaggerDelay)
+		}
+
 		go func(idx int, driveLetter string) {
 			defer wg.Done()
 
@@ -446,7 +479,7 @@ func (e *Executor) LabelAll(ctx context.Context, driveLetters []string, opts Lab
 
 			start := time.Now()
 
-			// Execute label change using Windows API
+			// Execute label change using Windows API (has built-in retry)
 			err := setVolumeLabel(driveLetter, opts.Label)
 
 			result := OperationResult{
