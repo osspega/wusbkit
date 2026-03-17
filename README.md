@@ -1,655 +1,290 @@
 # wusbkit
 
-A command-line toolkit for USB device management on Windows.
+A fast, native Windows CLI toolkit for USB drive management. Zero external dependencies — all operations use direct Win32 APIs (WMI, DeviceIoControl, VDS, fmifs).
 
 ## Features
 
-- List all connected USB storage devices
-- View detailed information about specific USB drives
-- Format USB drives with various filesystems (FAT32, NTFS, exFAT)
-- Flash disk images to USB drives (local files or remote URLs)
-- **Parallel operations** - Format or flash multiple USB drives simultaneously
+- **List** all connected USB storage devices (native WMI, sub-200ms)
+- **Flash** disk images to USB drives (.img, .bin, .iso, .raw)
+- **Create** disk images from USB drives (ImageUSB-compatible .bin format)
+- **Format** USB drives (FAT32, NTFS, exFAT) — FAT32 bypasses Windows 32GB limit
+- **Eject** USB drives safely
 - **Set volume labels** without reformatting
-- Safely eject USB drives
-- JSON output mode for programmatic use and external application integration
-- **Native WMI enumeration** for ultra-fast device listing (no PowerShell overhead)
-- PowerShell 7 backend for format/flash operations
-- Streaming decompression support (gzip, xz, zstd)
-- Real-time progress reporting with speed metrics
-- Disk locking to prevent concurrent operations
-- Signal handling for graceful cancellation (Ctrl+C)
-
-## Performance
-
-Device enumeration uses native Windows WMI queries via COM, bypassing PowerShell entirely for the `list` and `info` commands. This provides:
-
-- **10-40x faster** device listing compared to PowerShell-based enumeration
-- Sub-200ms response time even with many USB devices connected
-- Automatic fallback to PowerShell if WMI fails
-
-### Internal Optimizations
-
-- **Parallel WMI queries**: All 4 WMI queries run concurrently (2-4x faster listing)
-- **Single HTTP request**: URL sources use GET directly (no HEAD request overhead)
-- **Buffer pooling**: Reusable aligned buffers reduce allocations during parallel operations
-- **Native volume enumeration**: WMI-based volume lookup replaces PowerShell calls
-- **Drive letter caching**: Known drive letters skip redundant lookups
+- **Parallel operations** — flash, format, or label multiple drives simultaneously
+- **Streaming decompression** — flash from .gz, .xz, .zst files without extracting
+- **Remote flashing** — stream images directly from HTTP/HTTPS URLs
+- **Write verification** — read back and compare after flashing
+- **SHA-256 hashing** — calculate hash during write
+- **Skip-unchanged sectors** — faster partial updates
+- **Write retry logic** — 3 retries with 1s delay on failure (matches ImageUSB behavior)
+- **Pre-write speed test** — detects fake/unresponsive drives before flashing
+- **ImageUSB .bin header support** — auto-detects headers, verifies checksums
+- **ISO bootable USB** — detects bootloader (GRUB2, Syslinux, Windows), writes MBR
+- **Partition extension** — grow NTFS partition after flashing smaller images
+- **BitLocker detection** — warns before operating on encrypted drives
+- **JSON output** — all commands support `--json` for programmatic integration
+- **Disk locking** — prevents concurrent operations on the same drive
+- **Signal handling** — graceful cancellation with Ctrl+C
 
 ## Requirements
 
-- Windows 10/11
-- [PowerShell 7](https://github.com/PowerShell/PowerShell/releases) (pwsh.exe) - required for format/flash/eject operations
-- Administrator privileges (for format and flash operations)
+- Windows 10 or later (64-bit)
+- Administrator privileges (for format, flash, and create operations)
 
-> **Note:** The `list` and `info` commands use native WMI and do not require PowerShell 7.
+> **No PowerShell required.** All operations use native Windows APIs.
 
 ## Installation
+
+### From Releases
+
+Download `wusbkit.exe` from the [latest release](https://github.com/lazaroagomez/wusbkit/releases).
 
 ### From Source
 
 ```bash
-# Clone the repository
 git clone https://github.com/lazaroagomez/wusbkit.git
 cd wusbkit
-
-# Build
 go build -o dist/wusbkit.exe .
-
-# Or with version info
-go build -ldflags "-X github.com/lazaroagomez/wusbkit/cmd.Version=1.0.0" -o dist/wusbkit.exe .
 ```
 
-### Using Go Install
+## Quick Start
 
 ```bash
-go install github.com/lazaroagomez/wusbkit@latest
+# List USB drives
+wusbkit list
+
+# Flash an image (ChromeOS, Ubuntu, Raspberry Pi, etc.)
+wusbkit flash 2 --image recovery.bin --yes --verify --hash
+
+# Flash to multiple drives at once
+wusbkit flash 2,3,4 --image ubuntu.img --parallel --yes
+
+# Create a backup image from USB
+wusbkit create E: --output backup.bin
+
+# Format as FAT32 (works on drives > 32GB)
+wusbkit format 2 --fs fat32 --label "USB" --yes
+
+# Eject safely
+wusbkit eject E:
 ```
 
 ## Commands
 
-### List USB Drives
-
-List all connected USB storage devices.
+### `list` — List USB Drives
 
 ```bash
-# Basic list
-wusbkit list
-
-# Verbose output (includes serial, VID/PID, filesystem)
-wusbkit list --verbose
-wusbkit list -v
-
-# JSON output
-wusbkit list --json
-wusbkit list -j
+wusbkit list              # Table output
+wusbkit list -v           # Verbose (serial, VID/PID, filesystem, hub port)
+wusbkit list --json       # JSON array
 ```
 
-**Example output:**
-```
-┌────────────┬──────────────────────┬────────┬─────────┐
-│ Drive      │ Name                 │ Size   │ Status  │
-├────────────┼──────────────────────┼────────┼─────────┤
-│ E:         │ SanDisk Cruzer Glide │ 28.7 GB│ Healthy │
-└────────────┴──────────────────────┴────────┴─────────┘
-```
-
-### Show Drive Information
-
-Display detailed information about a specific USB drive.
+### `info` — Drive Details
 
 ```bash
-# By drive letter
-wusbkit info E:
-wusbkit info E
-
-# By disk number
-wusbkit info 2
-
-# JSON output
-wusbkit info E: --json
+wusbkit info E:           # By drive letter
+wusbkit info 2            # By disk number
+wusbkit info E: --json    # JSON output
 ```
 
-**Example output:**
-```
-# SanDisk Cruzer Glide
-
-Drive Letter    │ E:
-Disk Number     │ 2
-Model           │ Cruzer Glide
-Size            │ 28.7 GB
-Serial Number   │ 04016209041025010710
-File System     │ FAT32
-Volume Label    │ MYUSB
-Partition Style │ MBR
-Bus Type        │ USB
-Health Status   │ Healthy
-Status          │ Online
-```
-
-### Format USB Drive
-
-Format a USB storage device with the specified filesystem.
-
-> **Warning:** This will erase all data on the drive!
+### `flash` — Write Image to USB
 
 ```bash
-# Basic format (FAT32, quick format)
-wusbkit format E:
+# Local files
+wusbkit flash 2 --image ubuntu.img --yes
+wusbkit flash E: --image recovery.bin --verify --hash
 
-# Format with specific filesystem
-wusbkit format E: --fs ntfs
-wusbkit format E: --fs exfat
-wusbkit format E: --fs fat32
+# Compressed (streaming decompression)
+wusbkit flash 2 --image ubuntu.img.xz --yes
+wusbkit flash 2 --image raspios.img.gz --yes
+wusbkit flash 2 --image arch.img.zst --yes
 
-# Set volume label
-wusbkit format E: --fs exfat --label "MY_USB"
+# From URL (streams without downloading)
+wusbkit flash 2 --image https://example.com/image.img --yes
 
-# Full format (not quick)
-wusbkit format E: --fs ntfs --quick=false
+# Parallel flash (same image to multiple drives)
+wusbkit flash 2,3,4,5 --image ubuntu.img --parallel --yes
+wusbkit flash 2-6 --image recovery.bin --parallel --max-concurrent 3 --yes
 
-# Skip confirmation prompt
-wusbkit format E: --fs fat32 --yes
-wusbkit format E: --fs fat32 -y
-
-# Format by disk number
-wusbkit format 2 --fs ntfs --label DATA --yes
-
-# PARALLEL FORMAT - Multiple drives at once
-wusbkit format 2,3,4,5 --fs exfat --label "USB" --parallel --yes
-wusbkit format 2-6 --fs fat32 --parallel --yes
-wusbkit format 2,4-6,8 --fs exfat --parallel --max-concurrent 3 --yes
-
-# Parallel format with JSON output (NDJSON progress)
-wusbkit format 2,3,4 --fs exfat --parallel --json --yes
+# All options
+wusbkit flash 2 --image file.img --yes --verify --hash --skip-unchanged --buffer 8M
 ```
 
-**Filesystem options:**
-| Filesystem | Max File Size | Cross-Platform | Best For |
-|------------|---------------|----------------|----------|
-| FAT32      | 4 GB          | Excellent      | Maximum device compatibility |
-| exFAT      | 16 EB         | Good           | Large files, cross-platform |
-| NTFS       | 16 EB         | Windows only   | Windows-only, permissions |
+**Supported sources:** `.img`, `.bin`, `.iso`, `.raw`, `.gz`, `.xz`, `.zst`, `.zip`, HTTP/HTTPS URLs
 
-**Parallel format flags:**
-| Flag | Description |
-|------|-------------|
-| `--parallel` | Enable parallel formatting |
-| `--max-concurrent N` | Limit concurrent operations (0=unlimited) |
-
-**Multi-disk syntax:**
-- Single disk: `2` or `E:`
-- Multiple disks: `2,3,4`
-- Range: `2-6`
-- Mixed: `2,4-6,8`
-
-### Flash USB Drive
-
-Write a disk image directly to a USB drive (raw write).
-
-> **Warning:** This will completely overwrite the target drive!
+### `create` — Create Image from USB
 
 ```bash
-# Flash from local image file
-wusbkit flash E: --image ubuntu.img
-wusbkit flash 2 --image debian.iso
-
-# Flash from compressed image (streaming decompression)
-wusbkit flash E: --image ubuntu.img.gz
-wusbkit flash E: --image debian.iso.xz
-wusbkit flash E: --image arch.img.zst
-
-# Flash from ZIP archive (extracts first image file)
-wusbkit flash E: --image recovery.zip
-
-# Flash directly from URL (streams without downloading)
-wusbkit flash E: --image https://example.com/image.img
-
-# Verify after writing
-wusbkit flash E: --image ubuntu.img --verify
-
-# Calculate SHA-256 hash during write
-wusbkit flash E: --image ubuntu.img --hash
-
-# Skip unchanged sectors (faster for partial updates)
-wusbkit flash E: --image ubuntu.img --skip-unchanged
-
-# Custom buffer size (default: 4M, range: 1M-64M)
-wusbkit flash E: --image ubuntu.img --buffer 8M
-wusbkit flash E: --image ubuntu.img -b 16MB
-
-# Skip confirmation prompt
-wusbkit flash E: --image ubuntu.img --yes
-
-# JSON output for progress
-wusbkit flash 2 --image debian.iso --json --yes
-
-# PARALLEL FLASH - Same image to multiple drives
-wusbkit flash 2,3,4 --image ubuntu.img --parallel --yes
-wusbkit flash 2-6 --image raspios.img --parallel --yes
-wusbkit flash 2,4-6,8 --image debian.iso --parallel --max-concurrent 3 --yes
-
-# Parallel flash with JSON output (NDJSON progress)
-wusbkit flash 2,3,4 --image ubuntu.img --parallel --json --yes
+wusbkit create E: --output backup.bin --yes
+wusbkit create 2 --output D:\images\chromeos.bin --yes --json
 ```
 
-**Supported image sources:**
-| Source | Formats | Notes |
-|--------|---------|-------|
-| Local files | .img, .iso, .bin, .raw | Direct raw write |
-| Compressed | .gz, .xz, .zst, .zstd | Streaming decompression |
-| Archives | .zip | Extracts first image file |
-| Remote URLs | HTTP/HTTPS | Streams directly to drive |
+Creates an ImageUSB-compatible `.bin` file with a 512-byte header containing MD5 and SHA1 checksums. A companion `.log` file is generated alongside the image.
 
-**Parallel flash flags:**
-| Flag | Description |
-|------|-------------|
-| `--parallel` | Enable parallel flashing |
-| `--max-concurrent N` | Limit concurrent operations (0=unlimited) |
-
-**Multi-disk syntax:**
-- Single disk: `2` or `E:`
-- Multiple disks: `2,3,4`
-- Range: `2-6`
-- Mixed: `2,4-6,8`
-
-### Eject USB Drive
-
-Safely eject a USB storage device (same as "Safely Remove Hardware").
+### `format` — Format USB Drive
 
 ```bash
-# By drive letter
-wusbkit eject E:
-wusbkit eject E
-
-# By disk number
-wusbkit eject 2
-
-# Skip confirmation
-wusbkit eject E: --yes
-wusbkit eject E: -y
-
-# JSON output
-wusbkit eject E: --json
+wusbkit format 2 --fs fat32 --yes                        # FAT32 (no 32GB limit)
+wusbkit format E: --fs ntfs --label "DATA" --yes          # NTFS
+wusbkit format 2 --fs exfat --yes                         # exFAT
+wusbkit format 2,3,4 --fs fat32 --parallel --yes          # Parallel
 ```
 
-### Set Volume Label
+| Filesystem | Max File Size | Cross-Platform | Notes |
+|------------|--------------|----------------|-------|
+| FAT32 | 4 GB | Excellent | Custom formatter bypasses Windows 32GB limit |
+| NTFS | 16 EB | Windows | Full permissions support |
+| exFAT | 16 EB | Good | Large files + cross-platform |
 
-Change the volume label of a USB drive without reformatting.
-
-> **Note:** This operation does not require administrator privileges for USB drives.
+### `eject` — Safely Eject
 
 ```bash
-# Set label by drive letter
-wusbkit label E: --name "BACKUP_001"
-wusbkit label F --name "USB_DATA"
-
-# JSON output
-wusbkit label E: --name "MY_USB" --json
+wusbkit eject E:          # By drive letter
+wusbkit eject 2           # By disk number
+wusbkit eject E: --yes    # Skip confirmation
 ```
 
-### Show Version
+### `label` — Set Volume Label
 
-Display version and build information.
+```bash
+wusbkit label E: --name "BACKUP"
+wusbkit label E,F,G --name "USB" --parallel     # Multiple drives
+```
+
+> Does not require administrator privileges for USB drives.
+
+### `version` — Show Version
 
 ```bash
 wusbkit version
-
-# JSON output
 wusbkit version --json
 ```
 
 ## Global Flags
 
-These flags work with all commands:
-
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--json` | `-j` | Output in JSON format |
-| `--verbose` | `-v` | Show detailed/verbose output |
+| `--json` | `-j` | JSON output for programmatic use |
+| `--verbose` | `-v` | Verbose output |
 | `--no-color` | | Disable colored output |
 
-## JSON Output and Integration
+## Multi-Disk Syntax
 
-All commands support `--json` flag for programmatic use. This section provides detailed information for integrating wusbkit with external applications (Electron, Node.js, Python, etc.).
+All parallel commands accept flexible disk specifications:
 
-### Output Protocol
+| Syntax | Example | Meaning |
+|--------|---------|---------|
+| Single | `2` or `E:` | One drive |
+| List | `2,3,4` | Specific drives |
+| Range | `2-6` | Drives 2 through 6 |
+| Mixed | `2,4-6,8` | Drives 2, 4, 5, 6, 8 |
 
-- **stdout**: JSON data (success responses and progress updates)
-- **stderr**: JSON error objects
-- **Exit code 0**: Success
-- **Exit code 1**: Error (details in stderr)
+## JSON API
 
-### JSON Schemas
+All commands support `--json` for integration with external tools.
 
-#### Device Object
-
-Returned by `list` (as array) and `info` (as single object):
-
-```json
-{
-  "driveLetter": "E:",
-  "diskNumber": 2,
-  "friendlyName": "SanDisk Cruzer Glide",
-  "model": "Cruzer Glide",
-  "size": 30850000000,
-  "sizeHuman": "28.7 GB",
-  "serialNumber": "04016209041025010710",
-  "vendorId": "0781",
-  "productId": "5567",
-  "fileSystem": "FAT32",
-  "volumeLabel": "MYUSB",
-  "partitionStyle": "MBR",
-  "status": "Online",
-  "healthStatus": "Healthy",
-  "busType": "USB",
-  "mediaType": ""
-}
-```
-
-#### Version Object
-
-Returned by `version --json`:
-
-```json
-{
-  "version": "1.2.6",
-  "buildDate": "2024-01-15",
-  "goVersion": "go1.21.5",
-  "platform": "windows/amd64",
-  "pwshVersion": "7.4.1"
-}
-```
-
-#### Eject Result
-
-Returned by `eject --json`:
-
-```json
-{
-  "success": true,
-  "driveLetter": "E:",
-  "diskNumber": 2,
-  "message": "USB drive E: ejected successfully"
-}
-```
-
-#### Error Object
-
-Written to stderr on errors:
-
-```json
-{
-  "error": "USB drive E: not found",
-  "code": "USB_NOT_FOUND"
-}
-```
-
-### Progress Streaming
-
-Long-running operations (`format` and `flash`) emit progress as **newline-delimited JSON** (NDJSON). Each line is a complete JSON object.
-
-#### Format Progress
-
-```json
-{"drive":"E:","diskNumber":2,"stage":"Cleaning","percentage":10,"status":"in_progress"}
-{"drive":"E:","diskNumber":2,"stage":"Creating partition","percentage":30,"status":"in_progress"}
-{"drive":"E:","diskNumber":2,"stage":"Formatting","percentage":50,"status":"in_progress"}
-{"drive":"E:","diskNumber":2,"stage":"Assigning drive letter","percentage":80,"status":"in_progress"}
-{"drive":"E:","diskNumber":2,"stage":"Complete","percentage":100,"status":"complete"}
-```
-
-#### Flash Progress
-
-```json
-{"stage":"Writing","percentage":15,"bytes_written":524288000,"total_bytes":3500000000,"speed":"45.2 MB/s","status":"in_progress"}
-{"stage":"Writing","percentage":30,"bytes_written":1048576000,"total_bytes":3500000000,"speed":"48.1 MB/s","status":"in_progress"}
-{"stage":"Verifying","percentage":50,"bytes_written":1750000000,"total_bytes":3500000000,"speed":"52.3 MB/s","status":"in_progress"}
-{"stage":"Complete","percentage":100,"bytes_written":3500000000,"total_bytes":3500000000,"status":"complete","hash":"a1b2c3d4..."}
-```
-
-#### Parallel Operations Progress
-
-Parallel format/flash operations emit per-disk events:
-
-```json
-{"type":"start","diskNumber":2,"operation":"format"}
-{"type":"start","diskNumber":3,"operation":"format"}
-{"type":"start","diskNumber":4,"operation":"format"}
-{"type":"complete","diskNumber":2,"success":true,"duration":"12.5s"}
-{"type":"complete","diskNumber":4,"success":true,"duration":"14.2s"}
-{"type":"complete","diskNumber":3,"success":true,"duration":"15.1s"}
-{"type":"summary","total":3,"succeeded":3,"failed":0}
-```
-
-**Parallel progress fields:**
-| Field | Type | Description |
-|-------|------|-------------|
-| `type` | string | Event type: `start`, `complete`, or `summary` |
-| `diskNumber` | int | Disk number (not in summary) |
-| `operation` | string | `format` or `flash` |
-| `success` | bool | Operation succeeded (complete events) |
-| `error` | string | Error message if failed |
-| `duration` | string | Operation duration (complete events) |
-| `total` | int | Total disks (summary only) |
-| `succeeded` | int | Successful count (summary only) |
-| `failed` | int | Failed count (summary only) |
-
-**Progress fields:**
-| Field | Type | Description |
-|-------|------|-------------|
-| `stage` | string | Current operation stage |
-| `percentage` | int | Progress 0-100 |
-| `bytes_written` | int64 | Bytes written so far (flash only) |
-| `total_bytes` | int64 | Total bytes to write (flash only) |
-| `speed` | string | Write speed formatted (flash only) |
-| `status` | string | `in_progress`, `complete`, or `error` |
-| `error` | string | Error message (only when status is `error`) |
-| `hash` | string | SHA-256 hash (flash only, when `--hash` flag used) |
-| `bytes_skipped` | int64 | Bytes skipped (flash only, when `--skip-unchanged` used) |
+- **stdout**: JSON data and NDJSON progress streams
+- **stderr**: JSON error objects `{"error": "...", "code": "..."}`
+- **Exit 0**: Success, **Exit 1**: Error
 
 ### Error Codes
 
 | Code | Description |
 |------|-------------|
-| `USB_NOT_FOUND` | Specified USB device not found |
-| `PWSH_NOT_FOUND` | PowerShell 7 not installed or not in PATH |
+| `USB_NOT_FOUND` | Device not found |
 | `FORMAT_FAILED` | Format operation failed |
 | `FLASH_FAILED` | Flash operation failed |
-| `PERMISSION_DENIED` | Administrator privileges required |
-| `INVALID_INPUT` | Invalid command arguments |
-| `DISK_BUSY` | Another operation is in progress on this disk |
-| `INTERNAL_ERROR` | Unexpected internal error |
+| `PERMISSION_DENIED` | Admin privileges required |
+| `INVALID_INPUT` | Invalid arguments |
+| `DISK_BUSY` | Another operation in progress |
+| `INTERNAL_ERROR` | Unexpected error |
 
-### Integration Examples
+### Progress Streaming (NDJSON)
 
-#### Node.js / Electron
+Flash and format operations emit line-delimited JSON progress:
 
-```javascript
-const { spawn } = require('child_process');
-
-// List devices
-function listDevices() {
-  return new Promise((resolve, reject) => {
-    const proc = spawn('wusbkit.exe', ['list', '--json']);
-    let stdout = '';
-    let stderr = '';
-
-    proc.stdout.on('data', (data) => stdout += data);
-    proc.stderr.on('data', (data) => stderr += data);
-
-    proc.on('close', (code) => {
-      if (code === 0) {
-        resolve(JSON.parse(stdout));
-      } else {
-        reject(JSON.parse(stderr));
-      }
-    });
-  });
-}
-
-// Flash with progress
-function flashDrive(drive, imagePath, onProgress) {
-  const proc = spawn('wusbkit.exe', [
-    'flash', drive,
-    '--image', imagePath,
-    '--json', '--yes'
-  ]);
-
-  proc.stdout.on('data', (data) => {
-    const lines = data.toString().trim().split('\n');
-    lines.forEach(line => {
-      try {
-        const progress = JSON.parse(line);
-        onProgress(progress);
-      } catch (e) {
-        // Handle partial JSON chunks if needed
-      }
-    });
-  });
-
-  proc.stderr.on('data', (data) => {
-    const error = JSON.parse(data.toString());
-    onProgress({ status: 'error', error: error.error, code: error.code });
-  });
-
-  return proc;
-}
-
-// Usage
-flashDrive('E:', 'ubuntu.iso', (progress) => {
-  console.log(`${progress.stage}: ${progress.percentage}% - ${progress.speed}`);
-});
+```json
+{"stage":"Writing","percentage":45,"bytes_written":2348810240,"total_bytes":5170026496,"speed":"48.2 MB/s","status":"in_progress"}
+{"stage":"Verifying","percentage":90,"bytes_written":4653023846,"total_bytes":5170026496,"speed":"52.1 MB/s","status":"in_progress"}
+{"stage":"Complete","percentage":100,"status":"complete","hash":"c7425a15..."}
 ```
 
-#### Python
+Parallel operations emit per-disk events:
 
-```python
-import subprocess
-import json
-
-def list_devices():
-    result = subprocess.run(
-        ['wusbkit.exe', 'list', '--json'],
-        capture_output=True, text=True
-    )
-    if result.returncode == 0:
-        return json.loads(result.stdout)
-    else:
-        raise Exception(json.loads(result.stderr))
-
-def flash_with_progress(drive, image_path):
-    proc = subprocess.Popen(
-        ['wusbkit.exe', 'flash', drive, '--image', image_path, '--json', '--yes'],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-    )
-
-    for line in proc.stdout:
-        progress = json.loads(line.strip())
-        yield progress
+```json
+{"type":"start","diskNumber":2,"operation":"flash"}
+{"type":"complete","diskNumber":2,"success":true,"duration":"1m45s"}
+{"type":"summary","total":4,"succeeded":4,"failed":0}
 ```
 
-### Integration Tips
-
-1. **Always use `--json --yes` together** for non-interactive operation
-2. **Parse stdout line-by-line** for progress streaming
-3. **Check exit code AND stderr** for error detection
-4. **Handle `PERMISSION_DENIED`** by re-spawning with elevation
-5. **Check PowerShell first** with `wusbkit version --json` to verify `pwshVersion` is present
-6. **Graceful cancellation**: Send SIGINT (Ctrl+C) to cancel flash operations cleanly
-
-### Privilege Elevation
-
-Format and flash operations require administrator privileges. When running from a non-elevated process:
-
-**PowerShell elevation:**
-```powershell
-Start-Process -FilePath "wusbkit.exe" -ArgumentList "flash","E:","-i","image.iso","--json","--yes" -Verb RunAs -Wait
-```
-
-**Node.js with sudo-prompt:**
-```javascript
-const sudo = require('sudo-prompt');
-sudo.exec('wusbkit.exe flash E: --image image.iso --json --yes', options, callback);
-```
-
-## Building
-
-### Prerequisites
-
-- Go 1.21 or later
-- Windows 10/11
-
-### Build
-
-```bash
-# Using build script
-build.bat
-
-# Or manually
-go build -o dist/wusbkit.exe .
-```
-
-Releases are automatically created via GitHub Actions when pushing to main.
-
-## Project Structure
+## Architecture
 
 ```
 wusbkit/
-├── main.go                 # Entry point
-├── go.mod                  # Go module definition
-├── build.bat               # Build script
-├── VERSION                 # Current version number
-├── cmd/
-│   ├── root.go             # Root command, global flags
+├── cmd/                    # CLI commands (Cobra)
+│   ├── create.go           # create command
+│   ├── eject.go            # eject command (IOCTL_STORAGE_EJECT_MEDIA)
+│   ├── flash.go            # flash command
+│   ├── format.go           # format command
+│   ├── label.go            # label command (SetVolumeLabelW)
 │   ├── list.go             # list command
 │   ├── info.go             # info command
-│   ├── format.go           # format command (supports --parallel)
-│   ├── flash.go            # flash command (supports --parallel)
-│   ├── eject.go            # eject command
-│   ├── label.go            # label command
 │   └── version.go          # version command
 ├── internal/
-│   ├── powershell/
-│   │   └── executor.go     # PowerShell 7 execution wrapper
-│   ├── usb/
-│   │   ├── device.go           # USB device data models
-│   │   ├── enumerate.go        # USB enumeration logic (PowerShell fallback)
-│   │   └── enumerate_native.go # Native WMI enumeration (parallel queries)
-│   ├── format/
-│   │   └── format.go       # Format orchestration
-│   ├── flash/
-│   │   ├── flash.go        # Flash orchestration with buffer pooling
-│   │   ├── source.go       # Image sources (file, zip, URL, compressed)
-│   │   └── writer.go       # Raw disk writer with WMI volume lookup
-│   ├── parallel/
-│   │   └── executor.go     # Parallel format/flash orchestration
-│   ├── lock/
-│   │   └── disklock.go     # Disk locking for concurrency control
-│   └── output/
-│       ├── json.go         # JSON output helpers and error codes
+│   ├── disk/               # Native Win32 disk operations
+│   │   ├── ioctl.go        # DeviceIoControl wrappers
+│   │   ├── format_fat32.go # Custom FAT32 formatter (BPB + FAT tables)
+│   │   ├── format_vds.go   # NTFS/exFAT via fmifs.dll + VDS COM
+│   │   ├── extend.go       # Partition extension and creation
+│   │   ├── bitlocker.go    # BitLocker detection (WMI)
+│   │   └── volume.go       # Volume label operations
+│   ├── flash/              # Image flashing
+│   │   ├── flash.go        # Flash orchestration + retry + speed test
+│   │   ├── source.go       # Image sources (file, zip, URL, compressed, .bin)
+│   │   └── writer.go       # Raw disk writer + buffer pooling
+│   ├── format/             # Format orchestration
+│   │   └── format.go       # High-level format pipeline
+│   ├── image/              # ImageUSB .bin format
+│   │   ├── header.go       # 512-byte header codec
+│   │   └── create.go       # USB-to-image creation
+│   ├── iso/                # ISO bootable USB pipeline
+│   │   ├── pipeline.go     # ISO write orchestrator
+│   │   ├── bootloader.go   # Bootloader detection + MBR writing
+│   │   └── mbr/            # Embedded MBR templates (GRUB2, Syslinux, Windows)
+│   ├── encoding/           # Shared encoding utilities
+│   │   └── utf16le.go      # UTF-16LE codec
+│   ├── usb/                # USB device enumeration
+│   │   ├── device.go       # Device data models
+│   │   ├── enumerate.go    # Enumeration with caching
+│   │   ├── enumerate_native.go  # Native WMI (parallel queries)
+│   │   └── location_windows.go  # USB hub port via cfgmgr32
+│   ├── parallel/           # Parallel operations
+│   │   └── executor.go     # Batch format/flash/label with NDJSON
+│   ├── lock/               # Disk locking
+│   │   └── disklock.go     # File-based cross-process locks
+│   └── output/             # Display helpers
+│       ├── json.go         # JSON output + error codes
 │       └── table.go        # pterm table formatters
-└── dist/                   # Build output (gitignored)
+└── main.go                 # Entry point
 ```
 
-## Dependencies
+## How It Works
 
-### CLI Framework
-- [spf13/cobra](https://github.com/spf13/cobra) - Command-line interface framework
+All disk operations use **native Windows APIs** — no PowerShell, no diskpart, no external processes:
 
-### Terminal UI
-- [pterm/pterm](https://github.com/pterm/pterm) - Terminal output formatting, tables, spinners
-
-### Compression
-- [klauspost/compress](https://github.com/klauspost/compress) - Zstandard (zstd) decompression
-- [ulikunitz/xz](https://github.com/ulikunitz/xz) - XZ/LZMA decompression
-- Standard library `compress/gzip` - Gzip decompression
-- Standard library `archive/zip` - ZIP archive extraction
-
-### System
-- [StackExchange/wmi](https://github.com/StackExchange/wmi) - Native WMI queries for fast device enumeration
-- [gofrs/flock](https://github.com/gofrs/flock) - File-based locking for disk operations
-- [golang.org/x/sys](https://pkg.go.dev/golang.org/x/sys) - Windows system calls for raw disk I/O
-- [golang.org/x/sync](https://pkg.go.dev/golang.org/x/sync) - Concurrency primitives (errgroup for parallel operations)
+| Operation | API Used |
+|-----------|----------|
+| Device enumeration | WMI (Win32_DiskDrive, MSFT_Partition) |
+| Raw disk I/O | CreateFileW + ReadFile/WriteFile (unbuffered, 4KB aligned) |
+| Volume locking | FSCTL_LOCK_VOLUME + FSCTL_DISMOUNT_VOLUME |
+| Partition creation | IOCTL_DISK_CREATE_DISK + IOCTL_DISK_SET_DRIVE_LAYOUT_EX |
+| FAT32 formatting | Custom sector writer (BPB, FSInfo, FAT tables) |
+| NTFS/exFAT formatting | fmifs.dll FormatEx (VDS COM fallback) |
+| Partition extension | IOCTL_DISK_GROW_PARTITION + FSCTL_EXTEND_VOLUME |
+| Eject | IOCTL_STORAGE_EJECT_MEDIA |
+| Volume label | SetVolumeLabelW |
+| BitLocker detection | WMI (Win32_EncryptableVolume) |
+| Hub port location | cfgmgr32.dll (DEVPKEY_Device_LocationInfo) |
 
 ## License
 
