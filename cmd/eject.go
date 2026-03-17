@@ -1,14 +1,15 @@
 package cmd
 
 import (
-	"errors"
 	"fmt"
+	"syscall"
 
+	"github.com/lazaroagomez/wusbkit/internal/disk"
 	"github.com/lazaroagomez/wusbkit/internal/output"
-	"github.com/lazaroagomez/wusbkit/internal/powershell"
 	"github.com/lazaroagomez/wusbkit/internal/usb"
 	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/windows"
 )
 
 var ejectYes bool
@@ -40,16 +41,6 @@ func init() {
 func runEject(cmd *cobra.Command, args []string) error {
 	identifier := args[0]
 
-	// Check PowerShell availability
-	if err := powershell.CheckPwshAvailable(); err != nil {
-		if jsonOutput {
-			output.PrintJSONError("PowerShell 7 (pwsh.exe) is required but not found", output.ErrCodePwshNotFound)
-		} else {
-			PrintError("PowerShell 7 (pwsh.exe) is required but not found", output.ErrCodePwshNotFound)
-		}
-		return err
-	}
-
 	// Find the device
 	enum := usb.NewEnumerator()
 	device, err := enum.GetDevice(identifier)
@@ -62,21 +53,10 @@ func runEject(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Check if device has a drive letter (required for eject)
-	if device.DriveLetter == "" {
-		errMsg := fmt.Sprintf("USB disk %d has no drive letter assigned - cannot eject", device.DiskNumber)
-		if jsonOutput {
-			output.PrintJSONError(errMsg, output.ErrCodeInvalidInput)
-		} else {
-			PrintError(errMsg, output.ErrCodeInvalidInput)
-		}
-		return errors.New(errMsg)
-	}
-
 	// Confirmation prompt (unless --yes or --json)
 	if !ejectYes && !jsonOutput {
-		pterm.Info.Printf("Ejecting %s (%s - %s)\n",
-			device.DriveLetter, device.FriendlyName, device.SizeHuman)
+		pterm.Info.Printf("Ejecting disk %d (%s - %s)\n",
+			device.DiskNumber, device.FriendlyName, device.SizeHuman)
 
 		confirmed, _ := pterm.DefaultInteractiveConfirm.
 			WithDefaultValue(true).
@@ -88,28 +68,9 @@ func runEject(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Perform eject using Shell.Application COM object
-	driveLetter := device.DriveLetter
-	if len(driveLetter) == 2 && driveLetter[1] == ':' {
-		driveLetter = driveLetter[:1] + ":"
-	}
-
-	ps := powershell.NewExecutor(0)
-	ejectScript := fmt.Sprintf(`
-$shell = New-Object -ComObject Shell.Application
-$drive = $shell.Namespace(17).ParseName("%s")
-if ($drive) {
-    $drive.InvokeVerb("Eject")
-    Write-Output "OK"
-} else {
-    Write-Error "Drive not found"
-    exit 1
-}
-`, driveLetter)
-
-	_, err = ps.Execute(ejectScript)
-	if err != nil {
-		errMsg := fmt.Sprintf("Failed to eject %s: %v", device.DriveLetter, err)
+	// Eject using native IOCTL_STORAGE_EJECT_MEDIA — no PowerShell needed
+	if err := ejectDisk(device.DiskNumber); err != nil {
+		errMsg := fmt.Sprintf("Failed to eject disk %d: %v", device.DiskNumber, err)
 		if jsonOutput {
 			output.PrintJSONError(errMsg, output.ErrCodeInternalError)
 		} else {
@@ -119,16 +80,59 @@ if ($drive) {
 	}
 
 	// Output success
+	driveName := device.DriveLetter
+	if driveName == "" {
+		driveName = fmt.Sprintf("disk %d", device.DiskNumber)
+	}
+
 	if jsonOutput {
 		result := map[string]interface{}{
 			"success":     true,
 			"driveLetter": device.DriveLetter,
 			"diskNumber":  device.DiskNumber,
-			"message":     fmt.Sprintf("Successfully ejected %s", device.DriveLetter),
+			"message":     fmt.Sprintf("Successfully ejected %s", driveName),
 		}
 		return output.PrintJSON(result)
 	}
 
-	pterm.Success.Printf("Successfully ejected %s (%s)\n", device.DriveLetter, device.FriendlyName)
+	pterm.Success.Printf("Successfully ejected %s (%s)\n", driveName, device.FriendlyName)
+	return nil
+}
+
+// ejectDisk safely ejects a physical disk using native Windows API.
+func ejectDisk(diskNumber int) error {
+	path := fmt.Sprintf(`\\.\PhysicalDrive%d`, diskNumber)
+	pathPtr, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return fmt.Errorf("invalid disk path: %w", err)
+	}
+
+	handle, err := windows.CreateFile(
+		pathPtr,
+		windows.GENERIC_READ|windows.GENERIC_WRITE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+		nil,
+		windows.OPEN_EXISTING,
+		0,
+		0,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to open disk: %w", err)
+	}
+	defer windows.CloseHandle(handle)
+
+	var bytesReturned uint32
+	err = windows.DeviceIoControl(
+		handle,
+		disk.IOCTL_STORAGE_EJECT_MEDIA,
+		nil, 0,
+		nil, 0,
+		&bytesReturned,
+		nil,
+	)
+	if err != nil {
+		return fmt.Errorf("IOCTL_STORAGE_EJECT_MEDIA failed: %w", err)
+	}
+
 	return nil
 }

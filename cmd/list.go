@@ -1,10 +1,7 @@
 package cmd
 
 import (
-	"errors"
-
 	"github.com/lazaroagomez/wusbkit/internal/output"
-	"github.com/lazaroagomez/wusbkit/internal/powershell"
 	"github.com/lazaroagomez/wusbkit/internal/usb"
 	"github.com/spf13/cobra"
 )
@@ -27,26 +24,12 @@ func init() {
 }
 
 func runList(cmd *cobra.Command, args []string) error {
-	// Check PowerShell availability
-	if err := powershell.CheckPwshAvailable(); err != nil {
-		if jsonOutput {
-			output.PrintJSONError("PowerShell 7 (pwsh.exe) is required but not found", output.ErrCodePwshNotFound)
-		} else {
-			PrintError("PowerShell 7 (pwsh.exe) is required but not found", output.ErrCodePwshNotFound)
-		}
-		return err
-	}
-
 	// Enumerate USB devices
 	enum := usb.NewEnumerator()
 	devices, err := enum.ListDevices()
 	if err != nil {
 		if jsonOutput {
-			if errors.Is(err, powershell.ErrPwshNotFound) {
-				output.PrintJSONError(err.Error(), output.ErrCodePwshNotFound)
-			} else {
-				output.PrintJSONError(err.Error(), output.ErrCodeInternalError)
-			}
+			output.PrintJSONError(err.Error(), output.ErrCodeInternalError)
 		} else {
 			PrintError(err.Error(), output.ErrCodeInternalError)
 		}

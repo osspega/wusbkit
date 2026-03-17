@@ -4,7 +4,6 @@ import (
 	"runtime"
 
 	"github.com/lazaroagomez/wusbkit/internal/output"
-	"github.com/lazaroagomez/wusbkit/internal/powershell"
 	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
 )
@@ -21,11 +20,10 @@ func init() {
 }
 
 type versionInfo struct {
-	Version     string `json:"version"`
-	BuildDate   string `json:"buildDate"`
-	GoVersion   string `json:"goVersion"`
-	Platform    string `json:"platform"`
-	PwshVersion string `json:"pwshVersion,omitempty"`
+	Version   string `json:"version"`
+	BuildDate string `json:"buildDate"`
+	GoVersion string `json:"goVersion"`
+	Platform  string `json:"platform"`
 }
 
 func runVersion(cmd *cobra.Command, args []string) error {
@@ -34,11 +32,6 @@ func runVersion(cmd *cobra.Command, args []string) error {
 		BuildDate: BuildDate,
 		GoVersion: runtime.Version(),
 		Platform:  runtime.GOOS + "/" + runtime.GOARCH,
-	}
-
-	// Try to get PowerShell version
-	if pwshVer, err := powershell.GetPwshVersion(); err == nil {
-		info.PwshVersion = pwshVer
 	}
 
 	if jsonOutput {
@@ -52,10 +45,6 @@ func runVersion(cmd *cobra.Command, args []string) error {
 		{"Build Date", info.BuildDate},
 		{"Go Version", info.GoVersion},
 		{"Platform", info.Platform},
-	}
-
-	if info.PwshVersion != "" {
-		tableData = append(tableData, []string{"PowerShell", info.PwshVersion})
 	}
 
 	pterm.DefaultTable.WithData(tableData).Render()

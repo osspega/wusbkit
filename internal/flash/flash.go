@@ -20,6 +20,18 @@ const (
 // defaultBufferSize is the fallback buffer size (4MB) when not specified
 const defaultBufferSize = 4 << 20
 
+// Write retry constants (mirrors ImageUSB CopyBlock retry pattern)
+const (
+	maxWriteRetries = 3
+	retryDelay      = 1 * time.Second
+)
+
+// speedTestBlockSize is the block size for the pre-write speed test (1MB)
+const speedTestBlockSize = 1 << 20
+
+// speedTestMaxBlocks is the maximum number of 1MB blocks written during speed test
+const speedTestMaxBlocks = 10
+
 // Status constants
 const (
 	StatusInProgress = "in_progress"
@@ -96,6 +108,12 @@ func (f *Flasher) Flash(ctx context.Context, opts Options) (string, int64, error
 		return "", 0, err
 	}
 	defer writer.Close()
+
+	// Pre-write speed test: verify drive is responsive
+	if err := f.speedTest(writer); err != nil {
+		f.sendError(opts, err.Error())
+		return "", 0, err
+	}
 
 	// Write the image and get hash/skip stats
 	finalHash, bytesSkipped, err := f.writeImage(ctx, opts, source, writer, totalSize)
@@ -195,16 +213,16 @@ func (f *Flasher) writeImage(ctx context.Context, opts Options, source Source, w
 			}
 		}
 
-		// Write to disk only if needed
+		// Write to disk only if needed (with retry on failure)
 		if shouldWrite {
-			written, err := writer.WriteAt(writeBuffer, bytesWritten)
+			written, err := f.writeWithRetry(writer, writeBuffer, bytesWritten)
 			if err != nil {
 				f.sendError(opts, fmt.Sprintf("write error at offset %d: %v", bytesWritten, err))
 				return "", 0, err
 			}
 			if written < writeSize {
-				bytesWritten += int64(n)
-				break
+				f.sendError(opts, fmt.Sprintf("incomplete write at offset %d: wrote %d of %d bytes", bytesWritten, written, writeSize))
+				return "", 0, fmt.Errorf("incomplete write at offset %d: wrote %d of %d bytes", bytesWritten, written, writeSize)
 			}
 		}
 
@@ -325,6 +343,72 @@ func (f *Flasher) verifyImage(ctx context.Context, opts Options, writer *diskWri
 			}
 			f.sendProgress(opts, StageVerifying, percentage, bytesVerified, totalSize, speed)
 		}
+	}
+
+	return nil
+}
+
+// writeWithRetry writes data to disk, retrying on failure or partial writes.
+// On write error: retries up to maxWriteRetries times with retryDelay between attempts.
+// On partial write: retries the remaining bytes up to maxWriteRetries times.
+func (f *Flasher) writeWithRetry(writer *diskWriter, data []byte, offset int64) (int, error) {
+	totalWritten := 0
+	remaining := data
+	currentOffset := offset
+
+	for attempt := 0; attempt <= maxWriteRetries; attempt++ {
+		written, err := writer.WriteAt(remaining, currentOffset)
+		totalWritten += written
+
+		if err != nil {
+			if attempt < maxWriteRetries {
+				time.Sleep(retryDelay)
+				continue
+			}
+			return totalWritten, fmt.Errorf("write failed after %d retries: %w", maxWriteRetries, err)
+		}
+
+		if written >= len(remaining) {
+			return totalWritten, nil
+		}
+
+		// Partial write: advance past what was written and retry the rest
+		remaining = remaining[written:]
+		currentOffset += int64(written)
+
+		if attempt < maxWriteRetries {
+			time.Sleep(retryDelay)
+		}
+	}
+
+	return totalWritten, fmt.Errorf("partial write after %d retries: wrote %d of %d bytes", maxWriteRetries, totalWritten, len(data))
+}
+
+// speedTest writes up to 10MB of zeroes to verify the drive is responsive.
+// Stops early if 1 second has elapsed. Returns an error if zero blocks
+// were written (likely a fake or unresponsive drive).
+// The data is written at offset 0 and will be overwritten by the actual image.
+func (f *Flasher) speedTest(writer *diskWriter) error {
+	buf := make([]byte, speedTestBlockSize)
+
+	deadline := time.Now().Add(1 * time.Second)
+	blocksWritten := 0
+
+	for i := 0; i < speedTestMaxBlocks; i++ {
+		if time.Now().After(deadline) {
+			break
+		}
+
+		offset := int64(i) * int64(speedTestBlockSize)
+		_, err := writer.WriteAt(buf, offset)
+		if err != nil {
+			break
+		}
+		blocksWritten++
+	}
+
+	if blocksWritten == 0 {
+		return fmt.Errorf("drive unresponsive (possible fake drive)")
 	}
 
 	return nil

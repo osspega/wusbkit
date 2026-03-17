@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/lazaroagomez/wusbkit/internal/encoding"
 	"github.com/ulikunitz/xz"
 )
 
@@ -61,12 +62,21 @@ func OpenSource(path string) (Source, error) {
 	}
 }
 
-// rawSource reads directly from an uncompressed image file
+// rawSource reads directly from an uncompressed image file.
+// For ImageUSB .bin files with a 512-byte header, the header is skipped
+// and the reported size reflects only the image data.
 type rawSource struct {
 	file *os.File
 	size int64
 	name string
+	// ImageUSB .bin header fields (populated if header detected)
+	hasBinHeader bool
+	binMD5       string
+	binSHA1      string
 }
+
+// imageUSBHeaderSize is the fixed size of the ImageUSB .bin file header.
+const imageUSBHeaderSize = 512
 
 func newRawSource(path string) (*rawSource, error) {
 	file, err := os.Open(path)
@@ -85,11 +95,94 @@ func newRawSource(path string) (*rawSource, error) {
 		return nil, fmt.Errorf("image file is empty")
 	}
 
-	return &rawSource{
+	src := &rawSource{
 		file: file,
 		size: info.Size(),
 		name: filepath.Base(path),
-	}, nil
+	}
+
+	// For .bin files, check for ImageUSB header
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext == ".bin" && info.Size() > imageUSBHeaderSize {
+		if err := src.detectBinHeader(); err != nil {
+			file.Close()
+			return nil, err
+		}
+	}
+
+	return src, nil
+}
+
+// detectBinHeader checks if the file starts with an ImageUSB header.
+// If found, it seeks past the header and adjusts the reported size.
+func (r *rawSource) detectBinHeader() error {
+	// Read first 32 bytes to check the signature
+	var sigBuf [32]byte
+	if _, err := io.ReadFull(r.file, sigBuf[:]); err != nil {
+		// Can't read enough bytes, not a valid header — rewind and treat as raw
+		r.file.Seek(0, io.SeekStart)
+		return nil
+	}
+
+	if !hasImageUSBSignature(sigBuf[:]) {
+		// No valid signature — rewind to start
+		r.file.Seek(0, io.SeekStart)
+		return nil
+	}
+
+	// Valid header detected — read the fields we need
+	// Seek to offset 48 for ImageLength (uint64 LE, 8 bytes)
+	if _, err := r.file.Seek(48, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to read bin header: %w", err)
+	}
+
+	var imageLength uint64
+	if err := binary.Read(r.file, binary.LittleEndian, &imageLength); err != nil {
+		return fmt.Errorf("failed to read image length from bin header: %w", err)
+	}
+
+	// Read MD5 at offset 64, 66 bytes (UTF-16LE)
+	if _, err := r.file.Seek(64, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to read bin header: %w", err)
+	}
+	md5Buf := make([]byte, 66)
+	if _, err := io.ReadFull(r.file, md5Buf); err != nil {
+		return fmt.Errorf("failed to read MD5 from bin header: %w", err)
+	}
+
+	// Read SHA1 at offset 130, 82 bytes (UTF-16LE)
+	sha1Buf := make([]byte, 82)
+	if _, err := io.ReadFull(r.file, sha1Buf); err != nil {
+		return fmt.Errorf("failed to read SHA1 from bin header: %w", err)
+	}
+
+	r.hasBinHeader = true
+	r.size = int64(imageLength)
+	r.binMD5 = encoding.DecodeUTF16LE(md5Buf)
+	r.binSHA1 = encoding.DecodeUTF16LE(sha1Buf)
+
+	// Seek to start of actual image data (past the 512-byte header)
+	if _, err := r.file.Seek(imageUSBHeaderSize, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to seek past bin header: %w", err)
+	}
+
+	return nil
+}
+
+// hasImageUSBSignature checks if a 32-byte buffer starts with "imageUSB" when decoded as UTF-16LE.
+func hasImageUSBSignature(buf []byte) bool {
+	decoded := encoding.DecodeUTF16LE(buf)
+	return strings.HasPrefix(decoded, "imageUSB")
+}
+
+// BinHeaderChecksums returns the stored checksums if the source is an ImageUSB .bin file.
+// Returns empty strings and false if no header was detected or the source is not a raw source.
+func BinHeaderChecksums(s Source) (md5, sha1 string, ok bool) {
+	rs, isRaw := s.(*rawSource)
+	if !isRaw || !rs.hasBinHeader {
+		return "", "", false
+	}
+	return rs.binMD5, rs.binSHA1, true
 }
 
 func (r *rawSource) Size() int64 {

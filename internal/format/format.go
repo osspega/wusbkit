@@ -2,13 +2,14 @@ package format
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os/exec"
 	"strings"
 	"time"
 
-	"github.com/lazaroagomez/wusbkit/internal/powershell"
+	"github.com/lazaroagomez/wusbkit/internal/disk"
+	"golang.org/x/sys/windows"
 )
 
 // Options configures the format operation
@@ -49,7 +50,16 @@ const (
 	StageComplete          = "Complete"
 )
 
-// Formatter handles USB drive formatting operations
+// FormatResult represents the result of a format operation
+type FormatResult struct {
+	Success     bool   `json:"Success"`
+	DriveLetter string `json:"DriveLetter"`
+	Message     string `json:"Message"`
+}
+
+// Formatter handles USB drive formatting operations using native Win32 APIs.
+// No PowerShell dependency — all operations use direct DeviceIoControl calls,
+// a custom FAT32 formatter, and fmifs.dll/VDS for NTFS/exFAT.
 type Formatter struct {
 	progressChan chan Progress
 }
@@ -66,108 +76,178 @@ func (f *Formatter) Progress() <-chan Progress {
 	return f.progressChan
 }
 
-// FormatResult represents the result of a PowerShell format operation
-type FormatResult struct {
-	Success     bool   `json:"Success"`
-	DriveLetter string `json:"DriveLetter"`
-	Message     string `json:"Message"`
-}
-
-// Format formats a USB drive using PowerShell 7
+// Format formats a USB drive using native Windows APIs.
 func (f *Formatter) Format(ctx context.Context, opts Options) error {
 	defer close(f.progressChan)
 
-	// Send initial progress
-	f.sendProgress(opts, StageCleaning, 10)
-
-	// Generate PowerShell script
-	script := generateFormatScript(opts)
-
-	// Use longer timeout for full format
-	timeout := 60 * time.Second
-	if !opts.Quick {
-		timeout = 300 * time.Second
-	}
-
-	executor := powershell.NewExecutor(timeout)
-
-	f.sendProgress(opts, StageFormatting, 50)
-
-	// Execute PowerShell script
-	output, err := executor.ExecuteContext(ctx, script)
-	if err != nil {
-		f.sendError(opts, "PowerShell execution failed: "+err.Error())
-		return fmt.Errorf("powershell execution failed: %w", err)
-	}
-
-	// Parse JSON result
-	var result FormatResult
-	if err := json.Unmarshal(output, &result); err != nil {
-		f.sendError(opts, "Failed to parse result: "+err.Error())
-		return fmt.Errorf("failed to parse powershell result: %w", err)
-	}
-
-	if !result.Success {
-		f.sendError(opts, result.Message)
-		return fmt.Errorf("format failed: %s", result.Message)
-	}
-
-	f.sendComplete(opts, result.DriveLetter)
-	return nil
-}
-
-// generateFormatScript creates a PowerShell script for formatting
-func generateFormatScript(opts Options) string {
-	fs := strings.ToUpper(opts.FileSystem)
 	label := opts.Label
 	if label == "" {
 		label = "USB"
 	}
+	fs := strings.ToLower(opts.FileSystem)
 
-	formatFull := "$true"
-	if opts.Quick {
-		formatFull = "$false"
+	// Step 1: Open physical disk
+	f.sendProgress(opts, StageCleaning, 5)
+
+	handle, err := disk.OpenPhysicalDisk(opts.DiskNumber)
+	if err != nil {
+		f.sendError(opts, "Failed to open disk: "+err.Error())
+		return fmt.Errorf("open disk %d: %w", opts.DiskNumber, err)
+	}
+	defer windows.CloseHandle(handle)
+
+	// Step 2: Get disk geometry
+	geom, err := disk.GetDiskGeometry(handle)
+	if err != nil {
+		f.sendError(opts, "Failed to get disk geometry: "+err.Error())
+		return fmt.Errorf("get geometry disk %d: %w", opts.DiskNumber, err)
 	}
 
-	return fmt.Sprintf(`
-$ErrorActionPreference = 'Stop'
-$disk = %d
+	// Step 3: Create MBR partition table (clears existing partitions)
+	f.sendProgress(opts, StageCleaning, 15)
 
-try {
-    # Step 1: Ensure disk is writable (required for Initialize-Disk and Set-Disk)
-    Set-Disk -Number $disk -IsReadOnly $false -ErrorAction SilentlyContinue
+	mbrSignature := rand.Uint32()
+	if err := disk.CreateMBRDisk(handle, mbrSignature); err != nil {
+		f.sendError(opts, "Failed to create MBR: "+err.Error())
+		return fmt.Errorf("create MBR disk %d: %w", opts.DiskNumber, err)
+	}
 
-    # Step 2: Remove all existing partitions
-    Get-Partition -DiskNumber $disk -ErrorAction SilentlyContinue |
-        Remove-Partition -Confirm:$false -ErrorAction SilentlyContinue
+	if err := disk.UpdateDiskProperties(handle); err != nil {
+		// Non-fatal, continue
+		_ = err
+	}
 
-    # Step 3: Set partition style to MBR
-    # For removable media, use Set-Disk (Clear-Disk doesn't uninitialize removable media)
-    Set-Disk -Number $disk -PartitionStyle MBR -ErrorAction Stop
+	// Step 4: Create single partition spanning entire disk
+	f.sendProgress(opts, StageCreatingPartition, 25)
 
-    # Step 4: Refresh disk info
-    Update-Disk -Number $disk -ErrorAction SilentlyContinue
+	// Partition starts at sector offset (typically 1MB alignment = 2048 sectors for 512-byte sectors)
+	alignmentOffset := int64(1048576) // 1 MB
+	if alignmentOffset > geom.DiskSize/2 {
+		alignmentOffset = int64(geom.BytesPerSector) // Tiny disk: start at sector 1
+	}
 
-    # Step 5: Create bootable partition (-IsActive only valid on MBR disks)
-    $partition = New-Partition -DiskNumber $disk -UseMaximumSize -AssignDriveLetter -IsActive -ErrorAction Stop
+	partitionSize := geom.DiskSize - alignmentOffset
 
-    # Step 6: Format volume
-    Format-Volume -DriveLetter $partition.DriveLetter -FileSystem %s -NewFileSystemLabel '%s' -Full:%s -ErrorAction Stop | Out-Null
+	// Determine partition type
+	partType := byte(0x0C) // FAT32 LBA (default)
+	switch fs {
+	case "ntfs":
+		partType = 0x07 // NTFS/HPFS/exFAT
+	case "exfat":
+		partType = 0x07 // Same type ID as NTFS
+	case "fat32":
+		if geom.DiskSize > 4*1024*1024*1024 { // > 4GB
+			partType = 0x0C // FAT32 LBA
+		} else {
+			partType = 0x0B // FAT32 CHS
+		}
+	}
 
-    @{
-        Success = $true
-        DriveLetter = "$($partition.DriveLetter):"
-        Message = "Format complete"
-    } | ConvertTo-Json -Compress
+	partition := disk.MBRPartition{
+		PartitionType: partType,
+		BootIndicator: true,
+		StartOffset:   alignmentOffset,
+		Size:          partitionSize,
+	}
+
+	if err := disk.SetDriveLayoutMBR(handle, []disk.MBRPartition{partition}); err != nil {
+		f.sendError(opts, "Failed to create partition: "+err.Error())
+		return fmt.Errorf("set drive layout disk %d: %w", opts.DiskNumber, err)
+	}
+
+	if err := disk.UpdateDiskProperties(handle); err != nil {
+		_ = err
+	}
+
+	// Close disk handle before formatting — Windows needs exclusive access to the volume
+	windows.CloseHandle(handle)
+	handle = windows.InvalidHandle
+
+	// Step 5: Wait for Windows to recognize the new volume
+	f.sendProgress(opts, StageFormatting, 40)
+
+	// Re-open disk briefly to trigger volume detection
+	tmpHandle, err := disk.OpenPhysicalDisk(opts.DiskNumber)
+	if err == nil {
+		disk.UpdateDiskProperties(tmpHandle)
+		windows.CloseHandle(tmpHandle)
+	}
+
+	volumePath, err := disk.WaitForVolumeReady(windows.InvalidHandle, opts.DiskNumber, 15*time.Second)
+	if err != nil {
+		f.sendError(opts, "Volume not detected after partitioning: "+err.Error())
+		return fmt.Errorf("wait for volume disk %d: %w", opts.DiskNumber, err)
+	}
+
+	// Step 6: Format the volume
+	f.sendProgress(opts, StageFormatting, 50)
+
+	switch fs {
+	case "fat32":
+		// Use custom FAT32 formatter for speed and to bypass 32GB limit
+		err = f.formatFAT32Native(opts.DiskNumber, volumePath, label, geom, alignmentOffset, partitionSize)
+	case "ntfs", "exfat":
+		// Use fmifs.dll/VDS for NTFS and exFAT
+		err = disk.FormatVolume(disk.FormatVolumeOptions{
+			VolumePath:  volumePath,
+			FileSystem:  strings.ToUpper(fs),
+			Label:       label,
+			QuickFormat: opts.Quick || fs == "exfat", // exFAT always quick
+			ClusterSize: 0,                           // Default
+		})
+	}
+
+	if err != nil {
+		f.sendError(opts, "Format failed: "+err.Error())
+		return fmt.Errorf("format disk %d as %s: %w", opts.DiskNumber, fs, err)
+	}
+
+	// Step 7: Assign a drive letter if one isn't already assigned
+	f.sendProgress(opts, StageAssigningLetter, 90)
+
+	driveLetter, _ := disk.GetVolumeDriveLetter(volumePath)
+	if driveLetter == "" {
+		driveLetter, err = disk.AssignDriveLetter(volumePath)
+		if err != nil {
+			// Non-fatal — format succeeded even without a letter
+			driveLetter = ""
+		}
+	}
+
+	f.sendComplete(opts, driveLetter)
+	return nil
 }
-catch {
-    @{
-        Success = $false
-        DriveLetter = ""
-        Message = $_.Exception.Message
-    } | ConvertTo-Json -Compress
-}
-`, opts.DiskNumber, fs, label, formatFull)
+
+// formatFAT32Native formats a partition as FAT32 using direct sector writes.
+func (f *Formatter) formatFAT32Native(diskNumber int, volumePath, label string, geom *disk.DiskGeometry, partOffset, partSize int64) error {
+	// Open the physical disk for writing
+	handle, err := disk.OpenPhysicalDisk(diskNumber)
+	if err != nil {
+		return fmt.Errorf("open disk for FAT32 format: %w", err)
+	}
+	defer windows.CloseHandle(handle)
+
+	// Lock and dismount the volume first
+	if err := disk.LockVolume(handle); err != nil {
+		// Try to continue — might not have a mounted volume yet
+		_ = err
+	}
+	if err := disk.DismountVolume(handle); err != nil {
+		_ = err
+	}
+
+	hiddenSectors := uint32(partOffset / int64(geom.BytesPerSector))
+
+	return disk.FormatFAT32(disk.FormatFAT32Options{
+		DiskHandle:        handle,
+		PartitionOffset:   partOffset,
+		PartitionSize:     partSize,
+		VolumeLabel:       label,
+		BytesPerSector:    geom.BytesPerSector,
+		SectorsPerTrack:   geom.SectorsPerTrack,
+		TracksPerCylinder: geom.TracksPerCylinder,
+		HiddenSectors:     hiddenSectors,
+	})
 }
 
 func (f *Formatter) sendProgress(opts Options, stage string, percentage int) {
@@ -210,7 +290,6 @@ func (f *Formatter) sendComplete(opts Options, driveLetter string) {
 
 // IsAdmin checks if the current process has administrator privileges
 func IsAdmin() bool {
-	// Try to open a privileged registry key
 	cmd := exec.Command("net", "session")
 	err := cmd.Run()
 	return err == nil

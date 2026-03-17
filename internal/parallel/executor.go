@@ -10,19 +10,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lazaroagomez/wusbkit/internal/disk"
 	"github.com/lazaroagomez/wusbkit/internal/flash"
 	"github.com/lazaroagomez/wusbkit/internal/format"
 	"github.com/lazaroagomez/wusbkit/internal/lock"
-	"github.com/lazaroagomez/wusbkit/internal/powershell"
 )
-
-// setVolumeLabel sets the volume label using PowerShell Set-Volume
-func setVolumeLabel(driveLetter, label string) error {
-	ps := powershell.NewExecutor(30 * time.Second)
-	cmd := fmt.Sprintf(`Set-Volume -DriveLetter '%s' -NewFileSystemLabel '%s'`, driveLetter, label)
-	_, err := ps.Execute(cmd)
-	return err
-}
 
 // LabelOptions contains options for labeling drives
 type LabelOptions struct {
@@ -387,15 +379,33 @@ func (e *Executor) FlashAll(ctx context.Context, disks []int, opts flash.Options
 	return batch
 }
 
-// LabelAll labels multiple drives in parallel
+// labelStaggerDelay is the delay between starting label operations on different
+// drives. This prevents USB bus contention when multiple drives share a controller.
+const labelStaggerDelay = 200 * time.Millisecond
+
+// LabelAll labels multiple drives with controlled concurrency.
+// Uses a max concurrency of 2 by default for label operations to avoid
+// USB bus contention timeouts, with a stagger delay between starts.
 func (e *Executor) LabelAll(ctx context.Context, driveLetters []string, opts LabelOptions) BatchResult {
-	sem := make(chan struct{}, e.maxConcurrent)
+	// Cap label concurrency at 2 unless user explicitly set higher
+	maxConc := e.maxConcurrent
+	if maxConc > 2 {
+		maxConc = 2
+	}
+
+	sem := make(chan struct{}, maxConc)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	results := make([]OperationResult, len(driveLetters))
 
 	for i, dl := range driveLetters {
 		wg.Add(1)
+
+		// Stagger starts to avoid hitting the USB controller simultaneously
+		if i > 0 {
+			time.Sleep(labelStaggerDelay)
+		}
+
 		go func(idx int, driveLetter string) {
 			defer wg.Done()
 
@@ -430,8 +440,8 @@ func (e *Executor) LabelAll(ctx context.Context, driveLetters []string, opts Lab
 
 			start := time.Now()
 
-			// Execute label change using Windows API
-			err := setVolumeLabel(driveLetter, opts.Label)
+			// Execute label change using Windows API (has built-in retry)
+			err := disk.SetVolumeLabel(driveLetter, opts.Label)
 
 			result := OperationResult{
 				DriveLetter: driveLetter + ":",

@@ -4,7 +4,9 @@ go 1.25.3
 
 require (
 	github.com/StackExchange/wmi v1.2.1
+	github.com/go-ole/go-ole v1.3.0
 	github.com/gofrs/flock v0.13.0
+	github.com/kdomanski/iso9660 v0.4.0
 	github.com/klauspost/compress v1.18.1
 	github.com/pterm/pterm v0.12.82
 	github.com/spf13/cobra v1.10.1
@@ -18,7 +20,6 @@ require (
 	atomicgo.dev/keyboard v0.2.9 // indirect
 	atomicgo.dev/schedule v0.1.0 // indirect
 	github.com/containerd/console v1.0.5 // indirect
-	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/gookit/color v1.5.4 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/lithammer/fuzzysearch v1.1.8 // indirect

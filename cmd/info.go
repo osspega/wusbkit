@@ -1,12 +1,10 @@
 package cmd
 
 import (
-	"errors"
 	"strconv"
 	"strings"
 
 	"github.com/lazaroagomez/wusbkit/internal/output"
-	"github.com/lazaroagomez/wusbkit/internal/powershell"
 	"github.com/lazaroagomez/wusbkit/internal/usb"
 	"github.com/spf13/cobra"
 )
@@ -34,16 +32,6 @@ func init() {
 func runInfo(cmd *cobra.Command, args []string) error {
 	identifier := args[0]
 
-	// Check PowerShell availability
-	if err := powershell.CheckPwshAvailable(); err != nil {
-		if jsonOutput {
-			output.PrintJSONError("PowerShell 7 (pwsh.exe) is required but not found", output.ErrCodePwshNotFound)
-		} else {
-			PrintError("PowerShell 7 (pwsh.exe) is required but not found", output.ErrCodePwshNotFound)
-		}
-		return err
-	}
-
 	enum := usb.NewEnumerator()
 
 	var device *usb.Device
@@ -64,8 +52,6 @@ func runInfo(cmd *cobra.Command, args []string) error {
 				output.PrintJSONError(errMsg, output.ErrCodeUSBNotFound)
 			} else if strings.Contains(errMsg, "invalid") {
 				output.PrintJSONError(errMsg, output.ErrCodeInvalidInput)
-			} else if errors.Is(err, powershell.ErrPwshNotFound) {
-				output.PrintJSONError(errMsg, output.ErrCodePwshNotFound)
 			} else {
 				output.PrintJSONError(errMsg, output.ErrCodeInternalError)
 			}

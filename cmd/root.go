@@ -25,8 +25,9 @@ var rootCmd = &cobra.Command{
 	Short: "USB device management toolkit for Windows",
 	Long: `wusbkit is a CLI toolkit for USB device management on Windows.
 
-It provides commands to list, inspect, and format USB drives using
-PowerShell 7 for device enumeration and diskpart for formatting.`,
+It provides commands to list, inspect, flash, and format USB drives,
+create disk images, and write bootable ISOs using native Windows APIs
+(WMI, VDS, fmifs) with no external dependencies.`,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		if noColor {
 			pterm.DisableColor()

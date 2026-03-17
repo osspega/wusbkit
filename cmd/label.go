@@ -8,24 +8,14 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
+	"github.com/lazaroagomez/wusbkit/internal/disk"
 	"github.com/lazaroagomez/wusbkit/internal/output"
 	"github.com/lazaroagomez/wusbkit/internal/parallel"
-	"github.com/lazaroagomez/wusbkit/internal/powershell"
 	"github.com/lazaroagomez/wusbkit/internal/usb"
 	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
 )
-
-// setVolumeLabel sets the volume label using PowerShell Set-Volume
-func setVolumeLabel(driveLetter, label string) error {
-	ps := powershell.NewExecutor(30 * time.Second)
-	// Use Set-Volume cmdlet which handles permissions properly
-	cmd := fmt.Sprintf(`Set-Volume -DriveLetter '%s' -NewFileSystemLabel '%s'`, driveLetter, label)
-	_, err := ps.Execute(cmd)
-	return err
-}
 
 var (
 	labelName          string
@@ -118,7 +108,7 @@ func runSingleLabel(cmd *cobra.Command, args []string) error {
 	}
 
 	// Use Windows API to set volume label (no admin required for USB drives)
-	if err := setVolumeLabel(driveLetter, labelName); err != nil {
+	if err := disk.SetVolumeLabel(driveLetter, labelName); err != nil {
 		errMsg := fmt.Sprintf("failed to set label: %v", err)
 		if jsonOutput {
 			output.PrintJSONError(errMsg, output.ErrCodeInternalError)
