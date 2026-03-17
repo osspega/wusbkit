@@ -532,7 +532,10 @@ func vdsFormatVolumeMF(volMF *comObject, opts FormatVolumeOptions) error {
 	if label == "" {
 		label = "USB"
 	}
-	labelPtr, _ := syscall.UTF16PtrFromString(label)
+	labelPtr, err := syscall.UTF16PtrFromString(label)
+	if err != nil {
+		return fmt.Errorf("invalid volume label: %w", err)
+	}
 
 	quickFormat := uintptr(0)
 	if opts.QuickFormat {

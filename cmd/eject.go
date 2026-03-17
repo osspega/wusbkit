@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"syscall"
 
+	"github.com/lazaroagomez/wusbkit/internal/disk"
 	"github.com/lazaroagomez/wusbkit/internal/output"
 	"github.com/lazaroagomez/wusbkit/internal/usb"
 	"github.com/pterm/pterm"
@@ -36,9 +37,6 @@ func init() {
 	ejectCmd.Flags().BoolVarP(&ejectYes, "yes", "y", false, "Skip confirmation prompt")
 	rootCmd.AddCommand(ejectCmd)
 }
-
-// IOCTL_STORAGE_EJECT_MEDIA ejects removable media from the device.
-const ioctlStorageEjectMedia = 0x002D4808
 
 func runEject(cmd *cobra.Command, args []string) error {
 	identifier := args[0]
@@ -126,7 +124,7 @@ func ejectDisk(diskNumber int) error {
 	var bytesReturned uint32
 	err = windows.DeviceIoControl(
 		handle,
-		ioctlStorageEjectMedia,
+		disk.IOCTL_STORAGE_EJECT_MEDIA,
 		nil, 0,
 		nil, 0,
 		&bytesReturned,

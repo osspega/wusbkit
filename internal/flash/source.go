@@ -13,9 +13,9 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unicode/utf16"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/lazaroagomez/wusbkit/internal/encoding"
 	"github.com/ulikunitz/xz"
 )
 
@@ -158,8 +158,8 @@ func (r *rawSource) detectBinHeader() error {
 
 	r.hasBinHeader = true
 	r.size = int64(imageLength)
-	r.binMD5 = decodeUTF16LE(md5Buf)
-	r.binSHA1 = decodeUTF16LE(sha1Buf)
+	r.binMD5 = encoding.DecodeUTF16LE(md5Buf)
+	r.binSHA1 = encoding.DecodeUTF16LE(sha1Buf)
 
 	// Seek to start of actual image data (past the 512-byte header)
 	if _, err := r.file.Seek(imageUSBHeaderSize, io.SeekStart); err != nil {
@@ -171,23 +171,8 @@ func (r *rawSource) detectBinHeader() error {
 
 // hasImageUSBSignature checks if a 32-byte buffer starts with "imageUSB" when decoded as UTF-16LE.
 func hasImageUSBSignature(buf []byte) bool {
-	decoded := decodeUTF16LE(buf)
+	decoded := encoding.DecodeUTF16LE(buf)
 	return strings.HasPrefix(decoded, "imageUSB")
-}
-
-// decodeUTF16LE decodes a byte slice as UTF-16LE and returns the resulting string,
-// trimmed of null terminators.
-func decodeUTF16LE(b []byte) string {
-	if len(b) < 2 {
-		return ""
-	}
-	// Pair bytes into uint16 values (little-endian)
-	u16s := make([]uint16, len(b)/2)
-	for i := range u16s {
-		u16s[i] = uint16(b[2*i]) | uint16(b[2*i+1])<<8
-	}
-	runes := utf16.Decode(u16s)
-	return strings.TrimRight(string(runes), "\x00")
 }
 
 // BinHeaderChecksums returns the stored checksums if the source is an ImageUSB .bin file.

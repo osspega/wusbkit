@@ -8,7 +8,8 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"unicode/utf16"
+
+	"github.com/lazaroagomez/wusbkit/internal/encoding"
 )
 
 // HeaderSize is the fixed size of the ImageUSB .bin file header in bytes.
@@ -61,7 +62,7 @@ func ReadHeader(r io.ReadSeeker) (*Header, error) {
 	}
 
 	// Validate signature
-	sig := decodeUTF16LE(buf[offsetSignature:offsetSignature+signatureSize])
+	sig := encoding.DecodeUTF16LE(buf[offsetSignature:offsetSignature+signatureSize])
 	if sig != Signature {
 		return nil, nil
 	}
@@ -72,8 +73,8 @@ func ReadHeader(r io.ReadSeeker) (*Header, error) {
 		VersionBuild:    binary.LittleEndian.Uint32(buf[offsetVersion+8:]),
 		VersionRevision: binary.LittleEndian.Uint32(buf[offsetVersion+12:]),
 		ImageLength:     binary.LittleEndian.Uint64(buf[offsetImageLen:]),
-		MD5:             decodeUTF16LE(buf[offsetMD5 : offsetMD5+md5FieldSize]),
-		SHA1:            decodeUTF16LE(buf[offsetSHA1 : offsetSHA1+sha1FieldSize]),
+		MD5:             encoding.DecodeUTF16LE(buf[offsetMD5 : offsetMD5+md5FieldSize]),
+		SHA1:            encoding.DecodeUTF16LE(buf[offsetSHA1 : offsetSHA1+sha1FieldSize]),
 	}
 
 	return h, nil
@@ -89,7 +90,7 @@ func WriteHeader(w io.WriteSeeker, h *Header) error {
 	var buf [HeaderSize]byte
 
 	// Signature: "imageUSB" as UTF-16LE, null-padded to 32 bytes
-	encodeUTF16LE(buf[offsetSignature:offsetSignature+signatureSize], Signature)
+	encoding.EncodeUTF16LE(buf[offsetSignature:offsetSignature+signatureSize], Signature)
 
 	// Version fields
 	binary.LittleEndian.PutUint32(buf[offsetVersion:], h.VersionMajor)
@@ -103,10 +104,10 @@ func WriteHeader(w io.WriteSeeker, h *Header) error {
 	// Deprecated checksum field stays zero
 
 	// MD5 hex string as UTF-16LE
-	encodeUTF16LE(buf[offsetMD5:offsetMD5+md5FieldSize], h.MD5)
+	encoding.EncodeUTF16LE(buf[offsetMD5:offsetMD5+md5FieldSize], h.MD5)
 
 	// SHA1 hex string as UTF-16LE
-	encodeUTF16LE(buf[offsetSHA1:offsetSHA1+sha1FieldSize], h.SHA1)
+	encoding.EncodeUTF16LE(buf[offsetSHA1:offsetSHA1+sha1FieldSize], h.SHA1)
 
 	// Reserved area is already zero from array initialization
 
@@ -132,44 +133,3 @@ func IsImageUSBFile(path string) (bool, error) {
 	return h != nil, nil
 }
 
-// encodeUTF16LE writes a Go string into a fixed-size byte slice as UTF-16LE.
-// The destination is zero-filled first, so shorter strings are null-padded.
-func encodeUTF16LE(dst []byte, s string) {
-	clear(dst)
-
-	runes := []rune(s)
-	encoded := utf16.Encode(runes)
-
-	for i, codeUnit := range encoded {
-		offset := i * 2
-		if offset+1 >= len(dst) {
-			break
-		}
-		binary.LittleEndian.PutUint16(dst[offset:], codeUnit)
-	}
-}
-
-// decodeUTF16LE reads a UTF-16LE encoded string from a byte slice.
-// The returned string is trimmed at the first null character.
-func decodeUTF16LE(b []byte) string {
-	if len(b) < 2 {
-		return ""
-	}
-
-	// Convert byte pairs to uint16 code units
-	n := len(b) / 2
-	codeUnits := make([]uint16, n)
-	for i := range n {
-		codeUnits[i] = binary.LittleEndian.Uint16(b[i*2:])
-	}
-
-	// Find null terminator
-	for i, cu := range codeUnits {
-		if cu == 0 {
-			codeUnits = codeUnits[:i]
-			break
-		}
-	}
-
-	return string(utf16.Decode(codeUnits))
-}

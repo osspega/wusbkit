@@ -369,7 +369,10 @@ func (w *diskWriter) Close() error {
 	return nil
 }
 
-// alignedBuffer allocates a buffer aligned to 4096 bytes for unbuffered I/O
+// alignedBuffer allocates a buffer aligned to 4096 bytes for unbuffered I/O.
+// Go's runtime allocator returns naturally word-aligned memory, so the backing
+// array of the slice will be at least 8-byte aligned. We over-allocate by
+// `alignment` bytes and find the first 4096-aligned offset within the slice.
 func alignedBuffer(size int) []byte {
 	// Allocate extra space for alignment
 	buf := make([]byte, size+alignment)

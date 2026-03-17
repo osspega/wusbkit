@@ -8,59 +8,14 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
-	"unsafe"
 
+	"github.com/lazaroagomez/wusbkit/internal/disk"
 	"github.com/lazaroagomez/wusbkit/internal/output"
 	"github.com/lazaroagomez/wusbkit/internal/parallel"
 	"github.com/lazaroagomez/wusbkit/internal/usb"
 	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
 )
-
-const (
-	labelMaxRetries = 3
-	labelRetryDelay = 500 * time.Millisecond
-)
-
-// setVolumeLabel sets the volume label using the native Windows API.
-// Retries up to 3 times with 500ms delay to handle transient USB errors.
-func setVolumeLabel(driveLetter, label string) error {
-	rootPath := driveLetter + ":\\"
-	rootPtr, err := syscall.UTF16PtrFromString(rootPath)
-	if err != nil {
-		return fmt.Errorf("invalid drive letter: %w", err)
-	}
-	labelPtr, err := syscall.UTF16PtrFromString(label)
-	if err != nil {
-		return fmt.Errorf("invalid label: %w", err)
-	}
-
-	var lastErr error
-	for attempt := 0; attempt < labelMaxRetries; attempt++ {
-		if attempt > 0 {
-			time.Sleep(labelRetryDelay)
-		}
-		lastErr = setVolumeLabelW(rootPtr, labelPtr)
-		if lastErr == nil {
-			return nil
-		}
-	}
-	return fmt.Errorf("SetVolumeLabelW failed after %d attempts: %w", labelMaxRetries, lastErr)
-}
-
-var procSetVolumeLabelW = syscall.NewLazyDLL("kernel32.dll").NewProc("SetVolumeLabelW")
-
-func setVolumeLabelW(rootPathName *uint16, volumeName *uint16) error {
-	r1, _, err := procSetVolumeLabelW.Call(
-		uintptr(unsafe.Pointer(rootPathName)),
-		uintptr(unsafe.Pointer(volumeName)),
-	)
-	if r1 == 0 {
-		return err
-	}
-	return nil
-}
 
 var (
 	labelName          string
@@ -153,7 +108,7 @@ func runSingleLabel(cmd *cobra.Command, args []string) error {
 	}
 
 	// Use Windows API to set volume label (no admin required for USB drives)
-	if err := setVolumeLabel(driveLetter, labelName); err != nil {
+	if err := disk.SetVolumeLabel(driveLetter, labelName); err != nil {
 		errMsg := fmt.Sprintf("failed to set label: %v", err)
 		if jsonOutput {
 			output.PrintJSONError(errMsg, output.ErrCodeInternalError)

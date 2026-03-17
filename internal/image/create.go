@@ -16,14 +16,18 @@ import (
 	"github.com/lazaroagomez/wusbkit/internal/disk"
 )
 
+// Version stamp written into .bin headers. These package-level variables can
+// be overridden by the build system (e.g. an init function or build-time
+// code generation) to inject the release version.
+var (
+	VersionMajor    uint32 = 1
+	VersionMinor    uint32 = 0
+	VersionBuild    uint32 = 0
+	VersionRevision uint32 = 1
+)
+
 const (
 	defaultBufferSize = 1 << 20 // 1 MB
-
-	// wusbkit version stamp written into .bin headers
-	wusbkitVersionMajor    = 1
-	wusbkitVersionMinor    = 0
-	wusbkitVersionBuild    = 0
-	wusbkitVersionRevision = 1
 
 	// FAT32 maximum file size (4 GB - 1 byte)
 	fat32MaxFileSize = (4 << 30) - 1
@@ -112,10 +116,10 @@ func (c *Creator) Create(ctx context.Context, opts CreateOptions) error {
 
 	// Step 5: Write initial header with zeroed checksums
 	header := &Header{
-		VersionMajor:    wusbkitVersionMajor,
-		VersionMinor:    wusbkitVersionMinor,
-		VersionBuild:    wusbkitVersionBuild,
-		VersionRevision: wusbkitVersionRevision,
+		VersionMajor:    VersionMajor,
+		VersionMinor:    VersionMinor,
+		VersionBuild:    VersionBuild,
+		VersionRevision: VersionRevision,
 		ImageLength:     uint64(diskSize),
 	}
 	if err := WriteHeader(outFile, header); err != nil {

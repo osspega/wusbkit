@@ -54,8 +54,8 @@ func ParseVIDPID(pnpDeviceID string) (vid, pid string) {
 	return "", ""
 }
 
-// psRawDisk represents the raw disk data from PowerShell Get-Disk
-type psRawDisk struct {
+// rawDisk represents the raw disk data from Get-Disk queries.
+type rawDisk struct {
 	Number            int         `json:"Number"`
 	FriendlyName      string      `json:"FriendlyName"`
 	Model             string      `json:"Model"`
@@ -67,8 +67,8 @@ type psRawDisk struct {
 	BusType           string      `json:"BusType"`
 }
 
-// psRawPhysicalDisk represents the raw data from PowerShell Get-PhysicalDisk
-type psRawPhysicalDisk struct {
+// rawPhysicalDisk represents the raw data from Get-PhysicalDisk queries.
+type rawPhysicalDisk struct {
 	DeviceId      string `json:"DeviceId"`
 	FriendlyName  string `json:"FriendlyName"`
 	SerialNumber  string `json:"SerialNumber"`
@@ -77,16 +77,16 @@ type psRawPhysicalDisk struct {
 	HealthStatus  int    `json:"HealthStatus"`
 }
 
-// psRawPartition represents the raw data from PowerShell Get-Partition
-type psRawPartition struct {
+// rawPartition represents the raw data from Get-Partition queries.
+type rawPartition struct {
 	DiskNumber      int    `json:"DiskNumber"`
 	PartitionNumber int    `json:"PartitionNumber"`
 	DriveLetter     string `json:"DriveLetter"`
 	Size            int64  `json:"Size"`
 }
 
-// psRawVolume represents the raw data from PowerShell Get-Volume
-type psRawVolume struct {
+// rawVolume represents the raw data from Get-Volume queries.
+type rawVolume struct {
 	DriveLetter     string `json:"DriveLetter"`
 	FileSystemLabel string `json:"FileSystemLabel"`
 	FileSystem      string `json:"FileSystem"`
@@ -96,8 +96,8 @@ type psRawVolume struct {
 	DriveType       int    `json:"DriveType"`
 }
 
-// psRawWin32DiskDrive represents the raw data from Win32_DiskDrive
-type psRawWin32DiskDrive struct {
+// rawWin32DiskDrive represents the raw data from Win32_DiskDrive queries.
+type rawWin32DiskDrive struct {
 	DeviceID      string `json:"DeviceID"`
 	Index         int    `json:"Index"`
 	Model         string `json:"Model"`

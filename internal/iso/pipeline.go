@@ -52,22 +52,27 @@ func (w *Writer) Progress() <-chan WriteProgress {
 	return w.progressChan
 }
 
+// partitionResult holds the output of the partitionDisk step, needed by
+// subsequent pipeline stages.
+type partitionResult struct {
+	Geo         *disk.DiskGeometry
+	VolumePath  string
+	StartOffset int64
+	PartSize    int64
+}
+
 // Write executes the full ISO-to-USB pipeline:
 //  1. Scan ISO to detect bootloader type and large files
-//  2. Open physical disk and get geometry
-//  3. Create MBR partition table
-//  4. Wait for volume to be recognized
-//  5. Format volume (FAT32 or NTFS)
-//  6. Write bootloader MBR to sector 0
-//  7. Assign a drive letter
-//  8. Extract ISO contents to the mounted volume
-//  9. Flush and eject
+//  2. Partition the disk (open, create MBR, wait for volume)
+//  3. Format volume (FAT32 or NTFS)
+//  4. Write bootloader MBR to sector 0
+//  5. Assign drive letter and extract ISO contents
 func (w *Writer) Write(ctx context.Context, opts WriteOptions) error {
 	defer close(w.progressChan)
 
 	// Step 1: Scan ISO contents.
 	w.report("scanning", 0, "Scanning ISO contents")
-	scanResult, err := scanISO(opts.ISOPath)
+	scanResult, err := w.scanISO(opts.ISOPath)
 	if err != nil {
 		return w.fail("scanning", fmt.Errorf("scan ISO: %w", err))
 	}
@@ -92,28 +97,81 @@ func (w *Writer) Write(ctx context.Context, opts WriteOptions) error {
 		label = "USB"
 	}
 
-	// Step 2: Open physical disk and get geometry.
+	// Step 2: Partition the disk.
 	w.report("partitioning", 5, "Opening disk and reading geometry")
-	diskHandle, err := disk.OpenPhysicalDisk(opts.DiskNumber)
+	partResult, err := w.partitionDisk(ctx, opts.DiskNumber, fsType)
 	if err != nil {
-		return w.fail("partitioning", fmt.Errorf("open disk: %w", err))
+		return err // partitionDisk already calls w.fail
 	}
-	defer windows.CloseHandle(diskHandle)
 
 	if err := ctx.Err(); err != nil {
-		return w.fail("partitioning", err)
+		return w.fail("formatting", err)
+	}
+
+	// Step 3: Format the volume.
+	w.report("formatting", 20, fmt.Sprintf("Formatting as %s", fsType))
+	if err := w.formatVolume(opts.DiskNumber, partResult, fsType, label); err != nil {
+		return err // formatVolume already calls w.fail
+	}
+
+	if err := ctx.Err(); err != nil {
+		return w.fail("bootloader", err)
+	}
+
+	// Step 4: Write bootloader MBR.
+	w.report("bootloader", 35, fmt.Sprintf("Writing %s bootloader MBR", bootType))
+	if err := w.writeBootloader(opts.DiskNumber, bootType); err != nil {
+		return err // writeBootloader already calls w.fail
+	}
+
+	if err := ctx.Err(); err != nil {
+		return w.fail("extracting", err)
+	}
+
+	// Step 5: Extract ISO contents.
+	w.report("extracting", 45, "Extracting ISO contents")
+	if err := w.extractContents(ctx, opts.ISOPath, partResult.VolumePath); err != nil {
+		return err // extractContents already calls w.fail
+	}
+
+	w.report("complete", 100, "ISO written successfully")
+	return nil
+}
+
+// scanISO opens the ISO and walks its filesystem to detect bootloader
+// indicators and large files.
+func (w *Writer) scanISO(isoPath string) (*isoScanResult, error) {
+	return scanISO(isoPath)
+}
+
+// partitionDisk opens the physical disk, creates an MBR partition table, and
+// waits for Windows to recognize the new volume. It returns the geometry and
+// volume path needed by later stages. The disk handle is closed before
+// returning so that formatting can proceed.
+func (w *Writer) partitionDisk(ctx context.Context, diskNumber int, fsType string) (*partitionResult, error) {
+	diskHandle, err := disk.OpenPhysicalDisk(diskNumber)
+	if err != nil {
+		return nil, w.fail("partitioning", fmt.Errorf("open disk: %w", err))
+	}
+	defer func() {
+		if diskHandle != windows.InvalidHandle {
+			windows.CloseHandle(diskHandle)
+		}
+	}()
+
+	if err := ctx.Err(); err != nil {
+		return nil, w.fail("partitioning", err)
 	}
 
 	geo, err := disk.GetDiskGeometry(diskHandle)
 	if err != nil {
-		return w.fail("partitioning", fmt.Errorf("get geometry: %w", err))
+		return nil, w.fail("partitioning", fmt.Errorf("get geometry: %w", err))
 	}
 
-	// Step 3: Create MBR partition table.
 	w.report("partitioning", 10, "Creating MBR partition table")
 	signature := rand.Uint32()
 	if err := disk.CreateMBRDisk(diskHandle, signature); err != nil {
-		return w.fail("partitioning", fmt.Errorf("create MBR: %w", err))
+		return nil, w.fail("partitioning", fmt.Errorf("create MBR: %w", err))
 	}
 
 	// Determine partition type based on target filesystem.
@@ -135,22 +193,21 @@ func (w *Writer) Write(ctx context.Context, opts WriteOptions) error {
 		},
 	})
 	if err != nil {
-		return w.fail("partitioning", fmt.Errorf("set drive layout: %w", err))
+		return nil, w.fail("partitioning", fmt.Errorf("set drive layout: %w", err))
 	}
 
 	if err := disk.UpdateDiskProperties(diskHandle); err != nil {
-		return w.fail("partitioning", fmt.Errorf("update properties: %w", err))
+		return nil, w.fail("partitioning", fmt.Errorf("update properties: %w", err))
 	}
 
-	// Step 4: Wait for Windows to recognize the new volume.
 	w.report("partitioning", 15, "Waiting for volume to appear")
-	volumePath, err := disk.WaitForVolumeReady(diskHandle, opts.DiskNumber, 30*time.Second)
+	volumePath, err := disk.WaitForVolumeReady(diskHandle, diskNumber, 30*time.Second)
 	if err != nil {
-		return w.fail("partitioning", fmt.Errorf("volume not ready: %w", err))
+		return nil, w.fail("partitioning", fmt.Errorf("volume not ready: %w", err))
 	}
 
 	if err := ctx.Err(); err != nil {
-		return w.fail("partitioning", err)
+		return nil, w.fail("partitioning", err)
 	}
 
 	// Close the disk handle before formatting (Windows requires this).
@@ -158,37 +215,43 @@ func (w *Writer) Write(ctx context.Context, opts WriteOptions) error {
 	diskHandle = windows.InvalidHandle
 	time.Sleep(1 * time.Second)
 
-	// Step 5: Format the volume.
-	w.report("formatting", 20, fmt.Sprintf("Formatting as %s", fsType))
-	if err := formatVolume(volumePath, fsType, label, geo, startOffset, partSize, opts.DiskNumber); err != nil {
+	return &partitionResult{
+		Geo:         geo,
+		VolumePath:  volumePath,
+		StartOffset: startOffset,
+		PartSize:    partSize,
+	}, nil
+}
+
+// formatVolume formats the newly created volume with the appropriate
+// filesystem (FAT32 or NTFS).
+func (w *Writer) formatVolume(diskNumber int, pr *partitionResult, fsType, label string) error {
+	err := formatVolume(pr.VolumePath, fsType, label, pr.Geo, pr.StartOffset, pr.PartSize, diskNumber)
+	if err != nil {
 		return w.fail("formatting", fmt.Errorf("format volume: %w", err))
 	}
-
-	if err := ctx.Err(); err != nil {
-		return w.fail("formatting", err)
-	}
-
 	time.Sleep(1 * time.Second)
+	return nil
+}
 
-	// Step 6: Write bootloader MBR.
-	w.report("bootloader", 35, fmt.Sprintf("Writing %s bootloader MBR", bootType))
-	diskHandle, err = disk.OpenPhysicalDisk(opts.DiskNumber)
+// writeBootloader opens the physical disk and writes the appropriate MBR
+// bootstrap code to sector 0.
+func (w *Writer) writeBootloader(diskNumber int, bootType BootloaderType) error {
+	diskHandle, err := disk.OpenPhysicalDisk(diskNumber)
 	if err != nil {
 		return w.fail("bootloader", fmt.Errorf("reopen disk for bootloader: %w", err))
 	}
-	defer func() {
-		if diskHandle != windows.InvalidHandle {
-			windows.CloseHandle(diskHandle)
-		}
-	}()
+	defer windows.CloseHandle(diskHandle)
 
 	if err := WriteMBR(diskHandle, bootType); err != nil {
 		return w.fail("bootloader", fmt.Errorf("write bootloader: %w", err))
 	}
-	windows.CloseHandle(diskHandle)
-	diskHandle = windows.InvalidHandle
+	return nil
+}
 
-	// Step 7: Assign a drive letter.
+// extractContents assigns a drive letter to the volume and extracts the ISO
+// contents to the mounted filesystem.
+func (w *Writer) extractContents(ctx context.Context, isoPath, volumePath string) error {
 	w.report("mounting", 40, "Assigning drive letter")
 	driveLetter, err := ensureDriveLetter(volumePath)
 	if err != nil {
@@ -199,14 +262,9 @@ func (w *Writer) Write(ctx context.Context, opts WriteOptions) error {
 		return w.fail("mounting", err)
 	}
 
-	// Step 8: Extract ISO contents.
-	w.report("extracting", 45, "Extracting ISO contents")
-	if err := w.extractISO(ctx, opts.ISOPath, driveLetter); err != nil {
+	if err := w.extractISO(ctx, isoPath, driveLetter); err != nil {
 		return w.fail("extracting", fmt.Errorf("extract ISO: %w", err))
 	}
-
-	// Step 9: Complete.
-	w.report("complete", 100, "ISO written successfully")
 	return nil
 }
 

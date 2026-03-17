@@ -221,8 +221,8 @@ func (f *Flasher) writeImage(ctx context.Context, opts Options, source Source, w
 				return "", 0, err
 			}
 			if written < writeSize {
-				bytesWritten += int64(n)
-				break
+				f.sendError(opts, fmt.Sprintf("incomplete write at offset %d: wrote %d of %d bytes", bytesWritten, written, writeSize))
+				return "", 0, fmt.Errorf("incomplete write at offset %d: wrote %d of %d bytes", bytesWritten, written, writeSize)
 			}
 		}
 
