@@ -8,23 +8,45 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
+	"unsafe"
 
 	"github.com/lazaroagomez/wusbkit/internal/output"
 	"github.com/lazaroagomez/wusbkit/internal/parallel"
-	"github.com/lazaroagomez/wusbkit/internal/powershell"
 	"github.com/lazaroagomez/wusbkit/internal/usb"
 	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
 )
 
-// setVolumeLabel sets the volume label using PowerShell Set-Volume
+// setVolumeLabel sets the volume label using the native Windows API.
+// This is a direct Win32 call — no PowerShell overhead.
 func setVolumeLabel(driveLetter, label string) error {
-	ps := powershell.NewExecutor(30 * time.Second)
-	// Use Set-Volume cmdlet which handles permissions properly
-	cmd := fmt.Sprintf(`Set-Volume -DriveLetter '%s' -NewFileSystemLabel '%s'`, driveLetter, label)
-	_, err := ps.Execute(cmd)
-	return err
+	rootPath := driveLetter + ":\\"
+	rootPtr, err := syscall.UTF16PtrFromString(rootPath)
+	if err != nil {
+		return fmt.Errorf("invalid drive letter: %w", err)
+	}
+	labelPtr, err := syscall.UTF16PtrFromString(label)
+	if err != nil {
+		return fmt.Errorf("invalid label: %w", err)
+	}
+	err = setVolumeLabelW(rootPtr, labelPtr)
+	if err != nil {
+		return fmt.Errorf("SetVolumeLabelW failed: %w", err)
+	}
+	return nil
+}
+
+var procSetVolumeLabelW = syscall.NewLazyDLL("kernel32.dll").NewProc("SetVolumeLabelW")
+
+func setVolumeLabelW(rootPathName *uint16, volumeName *uint16) error {
+	r1, _, err := procSetVolumeLabelW.Call(
+		uintptr(unsafe.Pointer(rootPathName)),
+		uintptr(unsafe.Pointer(volumeName)),
+	)
+	if r1 == 0 {
+		return err
+	}
+	return nil
 }
 
 var (
