@@ -14,7 +14,6 @@ import (
 	"github.com/lazaroagomez/wusbkit/internal/lock"
 	"github.com/lazaroagomez/wusbkit/internal/output"
 	"github.com/lazaroagomez/wusbkit/internal/parallel"
-	"github.com/lazaroagomez/wusbkit/internal/powershell"
 	"github.com/lazaroagomez/wusbkit/internal/usb"
 	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
@@ -95,16 +94,6 @@ func runSingleFormat(cmd *cobra.Command, args []string) error {
 			PrintError(errMsg, output.ErrCodePermDenied)
 		}
 		return errors.New(errMsg)
-	}
-
-	// Check PowerShell availability
-	if err := powershell.CheckPwshAvailable(); err != nil {
-		if jsonOutput {
-			output.PrintJSONError("PowerShell 7 (pwsh.exe) is required but not found", output.ErrCodePwshNotFound)
-		} else {
-			PrintError("PowerShell 7 (pwsh.exe) is required but not found", output.ErrCodePwshNotFound)
-		}
-		return err
 	}
 
 	// Find the device
@@ -257,16 +246,6 @@ func runParallelFormat(cmd *cobra.Command, args []string) error {
 			PrintError(errMsg, output.ErrCodePermDenied)
 		}
 		return errors.New(errMsg)
-	}
-
-	// Check PowerShell availability
-	if err := powershell.CheckPwshAvailable(); err != nil {
-		if jsonOutput {
-			output.PrintJSONError("PowerShell 7 (pwsh.exe) is required but not found", output.ErrCodePwshNotFound)
-		} else {
-			PrintError("PowerShell 7 (pwsh.exe) is required but not found", output.ErrCodePwshNotFound)
-		}
-		return err
 	}
 
 	// Validate all disks exist and are USB
