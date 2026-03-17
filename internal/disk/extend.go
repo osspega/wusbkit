@@ -90,7 +90,7 @@ func extendFilesystem(diskNumber int, additionalBytes int64, bytesPerSector uint
 		return fmt.Errorf("find volume on disk %d: %w", diskNumber, err)
 	}
 
-	volumeHandle, err := openVolumeHandle(volumePath)
+	volumeHandle, err := OpenVolumeHandle(volumePath)
 	if err != nil {
 		return fmt.Errorf("open volume for extend: %w", err)
 	}
@@ -200,10 +200,10 @@ func findLastPartition(partitions []PartitionInfo) PartitionInfo {
 	return last
 }
 
-// openVolumeHandle opens a volume GUID path (e.g. \\?\Volume{GUID}\) for
+// OpenVolumeHandle opens a volume GUID path (e.g. \\?\Volume{GUID}\) for
 // read/write IOCTL access. The trailing backslash is removed so that we
 // open the device itself rather than the root directory.
-func openVolumeHandle(volumeGUIDPath string) (windows.Handle, error) {
+func OpenVolumeHandle(volumeGUIDPath string) (windows.Handle, error) {
 	devPath := strings.TrimRight(volumeGUIDPath, `\`)
 	pathPtr, err := syscall.UTF16PtrFromString(devPath)
 	if err != nil {

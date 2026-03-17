@@ -4,17 +4,30 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/kdomanski/iso9660"
 	"golang.org/x/sys/windows"
 
 	"github.com/lazaroagomez/wusbkit/internal/disk"
 )
+
+// IsWindowsISO mounts the ISO, scans its contents, and returns true if the
+// detected bootloader is Windows (i.e., no Linux bootloader markers found).
+// Returns false with a logged warning if the ISO cannot be mounted.
+func IsWindowsISO(isoPath string) bool {
+	drive, cleanup, err := disk.MountISO(isoPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not mount ISO for detection: %v\n", err)
+		return false
+	}
+	defer cleanup()
+	return scanMountedDir(drive).classifyBootloader() == BootloaderWindows
+}
 
 // WriteOptions configures how an ISO image is written to a USB drive.
 type WriteOptions struct {
@@ -62,20 +75,25 @@ type partitionResult struct {
 }
 
 // Write executes the full ISO-to-USB pipeline:
-//  1. Scan ISO to detect bootloader type and large files
+//  1. Mount ISO and scan contents to detect bootloader type and large files
 //  2. Partition the disk (open, create MBR, wait for volume)
 //  3. Format volume (FAT32 or NTFS)
-//  4. Write bootloader MBR to sector 0
-//  5. Assign drive letter and extract ISO contents
+//  4. Write bootloader MBR to sector 0 (skip for Windows UEFI)
+//  5. Assign drive letter and copy ISO contents to USB
 func (w *Writer) Write(ctx context.Context, opts WriteOptions) error {
 	defer close(w.progressChan)
 
-	// Step 1: Scan ISO contents.
-	w.report("scanning", 0, "Scanning ISO contents")
-	scanResult, err := w.scanISO(opts.ISOPath)
+	// Mount ISO once for the entire pipeline (scan + extract).
+	w.report("scanning", 0, "Mounting ISO image")
+	srcDrive, unmount, err := disk.MountISO(opts.ISOPath)
 	if err != nil {
-		return w.fail("scanning", fmt.Errorf("scan ISO: %w", err))
+		return w.fail("scanning", fmt.Errorf("mount ISO: %w", err))
 	}
+	defer unmount()
+
+	// Step 1: Scan mounted ISO contents.
+	w.report("scanning", 2, "Scanning ISO contents")
+	scanResult := scanMountedDir(srcDrive)
 
 	bootType := scanResult.classifyBootloader()
 
@@ -118,30 +136,28 @@ func (w *Writer) Write(ctx context.Context, opts WriteOptions) error {
 		return w.fail("bootloader", err)
 	}
 
-	// Step 4: Write bootloader MBR.
-	w.report("bootloader", 35, fmt.Sprintf("Writing %s bootloader MBR", bootType))
-	if err := w.writeBootloader(opts.DiskNumber, bootType); err != nil {
-		return err // writeBootloader already calls w.fail
+	// Step 4: Write bootloader MBR (skip for Windows — UEFI boots from EFI/ directory).
+	if bootType != BootloaderWindows {
+		w.report("bootloader", 35, fmt.Sprintf("Writing %s bootloader MBR", bootType))
+		if err := w.writeBootloader(opts.DiskNumber, bootType); err != nil {
+			return err // writeBootloader already calls w.fail
+		}
+	} else {
+		w.report("bootloader", 35, "Skipping MBR bootstrap (UEFI boot from EFI directory)")
 	}
 
 	if err := ctx.Err(); err != nil {
 		return w.fail("extracting", err)
 	}
 
-	// Step 5: Extract ISO contents.
-	w.report("extracting", 45, "Extracting ISO contents")
-	if err := w.extractContents(ctx, opts.ISOPath, partResult.VolumePath); err != nil {
-		return err // extractContents already calls w.fail
+	// Step 5: Copy ISO contents from mounted drive to USB.
+	w.report("extracting", 40, "Preparing to copy files")
+	if err := w.copyToUSB(ctx, srcDrive, partResult.VolumePath); err != nil {
+		return err
 	}
 
 	w.report("complete", 100, "ISO written successfully")
 	return nil
-}
-
-// scanISO opens the ISO and walks its filesystem to detect bootloader
-// indicators and large files.
-func (w *Writer) scanISO(isoPath string) (*isoScanResult, error) {
-	return scanISO(isoPath)
 }
 
 // partitionDisk opens the physical disk, creates an MBR partition table, and
@@ -249,22 +265,65 @@ func (w *Writer) writeBootloader(diskNumber int, bootType BootloaderType) error 
 	return nil
 }
 
-// extractContents assigns a drive letter to the volume and extracts the ISO
-// contents to the mounted filesystem.
-func (w *Writer) extractContents(ctx context.Context, isoPath, volumePath string) error {
-	w.report("mounting", 40, "Assigning drive letter")
-	driveLetter, err := ensureDriveLetter(volumePath)
+// copyToUSB assigns a drive letter to the USB volume and copies all files
+// from the mounted ISO drive to it.
+func (w *Writer) copyToUSB(ctx context.Context, srcDrive, volumePath string) error {
+	w.report("mounting", 40, "Assigning drive letter to USB")
+	dstDrive, err := ensureDriveLetter(volumePath)
 	if err != nil {
 		return w.fail("mounting", fmt.Errorf("assign drive letter: %w", err))
 	}
 
 	if err := ctx.Err(); err != nil {
-		return w.fail("mounting", err)
+		return w.fail("extracting", err)
 	}
 
-	if err := w.extractISO(ctx, isoPath, driveLetter); err != nil {
-		return w.fail("extracting", fmt.Errorf("extract ISO: %w", err))
+	// Count files for progress.
+	total := countFiles(srcDrive)
+	copied := 0
+
+	w.report("extracting", 45, "Copying files")
+	err = filepath.WalkDir(srcDrive, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		// Build relative path (forward slashes stripped of drive prefix).
+		relPath, err := filepath.Rel(srcDrive, path)
+		if err != nil {
+			return err
+		}
+		if relPath == "." {
+			return nil
+		}
+
+		dstPath := filepath.Join(dstDrive, relPath)
+
+		if d.IsDir() {
+			return os.MkdirAll(dstPath, 0o755)
+		}
+
+		if err := copyFile(path, dstPath); err != nil {
+			return fmt.Errorf("copy %s: %w", relPath, err)
+		}
+
+		copied++
+		if total > 0 {
+			pct := 45 + (copied*54)/total
+			if pct > 99 {
+				pct = 99
+			}
+			w.report("extracting", pct, fmt.Sprintf("Copying files (%d/%d)", copied, total))
+		}
+		return nil
+	})
+	if err != nil {
+		return w.fail("extracting", fmt.Errorf("copy files: %w", err))
 	}
+
 	return nil
 }
 
@@ -296,6 +355,14 @@ func (w *Writer) fail(stage string, err error) error {
 
 // formatVolume formats the volume with the appropriate filesystem.
 func formatVolume(volumePath, fsType, label string, geo *disk.DiskGeometry, partOffset, partSize int64, diskNumber int) error {
+	// Lock and dismount volume before formatting to avoid "volume in use" errors.
+	// Keep the handle open so the lock persists during the entire format.
+	if vh, err := disk.OpenVolumeHandle(volumePath); err == nil {
+		_ = disk.LockVolume(vh)
+		_ = disk.DismountVolume(vh)
+		defer windows.CloseHandle(vh)
+	}
+
 	if fsType == "FAT32" {
 		// Use the custom FAT32 formatter which bypasses the Windows 32 GB limit.
 		diskHandle, err := disk.OpenPhysicalDisk(diskNumber)
@@ -335,170 +402,67 @@ func ensureDriveLetter(volumePath string) (string, error) {
 	return disk.AssignDriveLetter(volumePath)
 }
 
-// scanISO opens the ISO and walks its filesystem to detect bootloader
-// indicators and large files.
-func scanISO(isoPath string) (*isoScanResult, error) {
-	f, err := os.Open(isoPath)
-	if err != nil {
-		return nil, fmt.Errorf("open ISO file: %w", err)
-	}
-	defer f.Close()
-
-	img, err := iso9660.OpenImage(f)
-	if err != nil {
-		return nil, fmt.Errorf("parse ISO image: %w", err)
-	}
-
-	root, err := img.RootDir()
-	if err != nil {
-		return nil, fmt.Errorf("read ISO root directory: %w", err)
-	}
-
+// scanMountedDir walks a mounted directory and returns scan results for
+// bootloader detection and large file checks.
+func scanMountedDir(root string) *isoScanResult {
 	result := &isoScanResult{}
-	walkISODir(root, "", result)
-	return result, nil
-}
-
-// walkISODir recursively walks an ISO directory tree and updates the scan result.
-func walkISODir(dir *iso9660.File, prefix string, result *isoScanResult) {
-	children, err := dir.GetChildren()
-	if err != nil {
-		return
-	}
-
-	for _, child := range children {
-		name := child.Name()
-		if name == "\x00" || name == "\x01" {
-			// Current directory (.) and parent (..) entries in ISO 9660.
-			continue
+	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // skip inaccessible entries
 		}
-
-		fullPath := prefix + name
-		result.classifyPath(fullPath, child.IsDir(), int64(child.Size()))
-
-		if child.IsDir() {
-			walkISODir(child, fullPath+"/", result)
+		relPath, relErr := filepath.Rel(root, path)
+		if relErr != nil || relPath == "." {
+			return nil
 		}
-	}
-}
+		// Convert to forward slashes for classifyPath compatibility.
+		relPath = strings.ReplaceAll(relPath, `\`, "/")
 
-// extractISO extracts all files from the ISO image to the target directory.
-// It uses the pure Go iso9660 library to read the ISO filesystem.
-func (w *Writer) extractISO(ctx context.Context, isoPath, targetDir string) error {
-	f, err := os.Open(isoPath)
-	if err != nil {
-		return fmt.Errorf("open ISO: %w", err)
-	}
-	defer f.Close()
-
-	img, err := iso9660.OpenImage(f)
-	if err != nil {
-		return fmt.Errorf("parse ISO: %w", err)
-	}
-
-	root, err := img.RootDir()
-	if err != nil {
-		return fmt.Errorf("read root directory: %w", err)
-	}
-
-	// Count total files for progress reporting.
-	totalFiles := countISOFiles(root)
-	extracted := 0
-
-	return w.extractDir(ctx, root, targetDir, &extracted, totalFiles)
-}
-
-// extractDir recursively extracts an ISO directory to the filesystem.
-func (w *Writer) extractDir(ctx context.Context, dir *iso9660.File, targetDir string, extracted *int, total int) error {
-	children, err := dir.GetChildren()
-	if err != nil {
-		return fmt.Errorf("list directory: %w", err)
-	}
-
-	for _, child := range children {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		name := child.Name()
-		if name == "\x00" || name == "\x01" {
-			continue
-		}
-
-		// Remove ISO 9660 version suffix (";1") if present.
-		if idx := strings.Index(name, ";"); idx >= 0 {
-			name = name[:idx]
-		}
-
-		targetPath := filepath.Join(targetDir, name)
-
-		if child.IsDir() {
-			if err := os.MkdirAll(targetPath, 0o755); err != nil {
-				return fmt.Errorf("create directory %s: %w", targetPath, err)
+		var fileSize int64
+		if !d.IsDir() {
+			if info, infoErr := d.Info(); infoErr == nil {
+				fileSize = info.Size()
 			}
-			if err := w.extractDir(ctx, child, targetPath, extracted, total); err != nil {
-				return err
-			}
-			continue
 		}
-
-		if err := extractFile(child, targetPath); err != nil {
-			return fmt.Errorf("extract %s: %w", targetPath, err)
-		}
-
-		*extracted++
-		if total > 0 {
-			// Map extraction progress to 45%-99% of overall progress.
-			pct := 45 + (*extracted*54)/total
-			if pct > 99 {
-				pct = 99
-			}
-			w.report("extracting", pct, fmt.Sprintf("Extracting files (%d/%d)", *extracted, total))
-		}
-	}
-
-	return nil
+		result.classifyPath(relPath, d.IsDir(), fileSize)
+		return nil
+	})
+	return result
 }
 
-// extractFile writes a single ISO file entry to the target filesystem path.
-func extractFile(isoFile *iso9660.File, targetPath string) error {
-	dir := filepath.Dir(targetPath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create parent directory: %w", err)
-	}
-
-	outFile, err := os.Create(targetPath)
-	if err != nil {
-		return fmt.Errorf("create file: %w", err)
-	}
-	defer outFile.Close()
-
-	reader := isoFile.Reader()
-	if _, err := io.Copy(outFile, reader); err != nil {
-		return fmt.Errorf("write file contents: %w", err)
-	}
-
-	return nil
-}
-
-// countISOFiles counts the total number of files (non-directories) in the ISO.
-func countISOFiles(dir *iso9660.File) int {
+// countFiles counts non-directory entries under root.
+func countFiles(root string) int {
 	count := 0
-	children, err := dir.GetChildren()
-	if err != nil {
-		return 0
-	}
-
-	for _, child := range children {
-		name := child.Name()
-		if name == "\x00" || name == "\x01" {
-			continue
+	filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
 		}
-		if child.IsDir() {
-			count += countISOFiles(child)
-		} else {
+		if !d.IsDir() {
 			count++
 		}
-	}
+		return nil
+	})
 	return count
+}
+
+// copyFile copies a single file from src to dst using a 1 MB buffer.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	buf := make([]byte, 1<<20) // 1 MB buffer
+	_, err = io.CopyBuffer(out, in, buf)
+	return err
 }

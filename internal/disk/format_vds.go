@@ -233,6 +233,8 @@ func formatViaFmifs(opts FormatVolumeOptions) error {
 
 func fmifsErrorFromCommand(cmd fmifsCallbackCommand) error {
 	switch cmd {
+	case fmifsProgress:
+		return fmt.Errorf("format failed (volume may be locked or in use)")
 	case fmifsIncompatibleFileSystem:
 		return fmt.Errorf("incompatible filesystem for this volume")
 	case fmifsAccessDenied:
@@ -699,6 +701,46 @@ func FindVolumeByDiskNumber(diskNumber int) (string, error) {
 	}
 
 	return "", fmt.Errorf("no volume found on PhysicalDrive%d", diskNumber)
+}
+
+// FindAllVolumesByDiskNumber enumerates all volumes on the system and returns
+// every volume GUID path (e.g. `\\?\Volume{GUID}\`) residing on the given
+// physical disk number. Returns nil (not an error) if no volumes are found.
+func FindAllVolumesByDiskNumber(diskNumber int) []string {
+	buf := make([]uint16, 260)
+
+	hFind, _, err := procFindFirstVolumeW.Call(
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(len(buf)),
+	)
+	handle := windows.Handle(hFind)
+	if handle == windows.InvalidHandle {
+		_ = err
+		return nil
+	}
+	defer procFindVolumeClose.Call(hFind)
+
+	var volumes []string
+	for {
+		volumePath := windows.UTF16ToString(buf)
+		if matchesPhysicalDisk(volumePath, diskNumber) {
+			volumes = append(volumes, volumePath)
+		}
+
+		r, _, err := procFindNextVolumeW.Call(
+			hFind,
+			uintptr(unsafe.Pointer(&buf[0])),
+			uintptr(len(buf)),
+		)
+		if r == 0 {
+			if errno, ok := err.(syscall.Errno); ok && errno == 18 {
+				break
+			}
+			break
+		}
+	}
+
+	return volumes
 }
 
 // matchesPhysicalDisk checks whether a volume GUID path resides on the given

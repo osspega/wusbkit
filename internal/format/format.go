@@ -187,6 +187,12 @@ func (f *Formatter) Format(ctx context.Context, opts Options) error {
 		// Use custom FAT32 formatter for speed and to bypass 32GB limit
 		err = f.formatFAT32Native(opts.DiskNumber, volumePath, label, geom, alignmentOffset, partitionSize)
 	case "ntfs", "exfat":
+		// Lock and dismount volume before fmifs format
+		if vh, vhErr := disk.OpenVolumeHandle(volumePath); vhErr == nil {
+			_ = disk.LockVolume(vh)
+			_ = disk.DismountVolume(vh)
+			windows.CloseHandle(vh)
+		}
 		// Use fmifs.dll/VDS for NTFS and exFAT
 		err = disk.FormatVolume(disk.FormatVolumeOptions{
 			VolumePath:  volumePath,
@@ -220,21 +226,20 @@ func (f *Formatter) Format(ctx context.Context, opts Options) error {
 
 // formatFAT32Native formats a partition as FAT32 using direct sector writes.
 func (f *Formatter) formatFAT32Native(diskNumber int, volumePath, label string, geom *disk.DiskGeometry, partOffset, partSize int64) error {
-	// Open the physical disk for writing
+	// Lock and dismount the volume first (requires a volume handle, not disk handle).
+	volumeHandle, err := disk.OpenVolumeHandle(volumePath)
+	if err == nil {
+		_ = disk.LockVolume(volumeHandle)
+		_ = disk.DismountVolume(volumeHandle)
+		defer windows.CloseHandle(volumeHandle)
+	}
+
+	// Open the physical disk for raw sector writes
 	handle, err := disk.OpenPhysicalDisk(diskNumber)
 	if err != nil {
 		return fmt.Errorf("open disk for FAT32 format: %w", err)
 	}
 	defer windows.CloseHandle(handle)
-
-	// Lock and dismount the volume first
-	if err := disk.LockVolume(handle); err != nil {
-		// Try to continue — might not have a mounted volume yet
-		_ = err
-	}
-	if err := disk.DismountVolume(handle); err != nil {
-		_ = err
-	}
 
 	hiddenSectors := uint32(partOffset / int64(geom.BytesPerSector))
 

@@ -7,7 +7,7 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/StackExchange/wmi"
+	"github.com/lazaroagomez/wusbkit/internal/disk"
 	"golang.org/x/sys/windows"
 )
 
@@ -63,18 +63,6 @@ func PutBuffer(size int, buf []byte) {
 	if exists {
 		pool.Put(buf)
 	}
-}
-
-// Win32_DiskDriveToDiskPartition represents WMI association
-type Win32_DiskDriveToDiskPartition struct {
-	Antecedent string
-	Dependent  string
-}
-
-// Win32_LogicalDiskToPartitionAssoc represents WMI association
-type Win32_LogicalDiskToPartitionAssoc struct {
-	Antecedent string
-	Dependent  string
 }
 
 const (
@@ -162,150 +150,65 @@ func (w *diskWriter) Open() error {
 	return nil
 }
 
-// lockVolumes finds and locks all volumes on this physical disk
+// lockVolumes finds and locks all volumes on this physical disk.
+// Uses volume GUID enumeration (via IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS)
+// which finds all volumes regardless of whether they have drive letters.
 func (w *diskWriter) lockVolumes() error {
-	// Get volume letters for this disk via PowerShell
-	letters, err := w.getVolumeLetters()
-	if err != nil {
-		// Non-fatal: disk might not have volumes
-		return nil
+	// Try cached drive letter first (fastest path for single-partition drives)
+	if w.cachedDriveLetter != "" {
+		w.lockSingleVolume(fmt.Sprintf(`\\.\%s:`, w.cachedDriveLetter))
 	}
 
-	for _, letter := range letters {
-		volumePath := fmt.Sprintf(`\\.\%s:`, letter)
-		pathPtr, err := syscall.UTF16PtrFromString(volumePath)
-		if err != nil {
-			continue
-		}
-
-		handle, err := windows.CreateFile(
-			pathPtr,
-			windows.GENERIC_READ|windows.GENERIC_WRITE,
-			windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
-			nil,
-			windows.OPEN_EXISTING,
-			0,
-			0,
-		)
-		if err != nil {
-			continue
-		}
-
-		// Lock the volume
-		var bytesReturned uint32
-		err = windows.DeviceIoControl(
-			handle,
-			FSCTL_LOCK_VOLUME,
-			nil, 0, nil, 0,
-			&bytesReturned, nil,
-		)
-		if err != nil {
-			windows.CloseHandle(handle)
-			continue
-		}
-
-		// Dismount the volume
-		_ = windows.DeviceIoControl(
-			handle,
-			FSCTL_DISMOUNT_VOLUME,
-			nil, 0, nil, 0,
-			&bytesReturned, nil,
-		)
-
-		w.volumes = append(w.volumes, handle)
+	// Enumerate ALL volumes on this disk by GUID path — catches partitions
+	// without drive letters (e.g. ChromeOS, multi-partition layouts).
+	for _, guidPath := range disk.FindAllVolumesByDiskNumber(w.diskNumber) {
+		devPath := strings.TrimRight(guidPath, `\`)
+		w.lockSingleVolume(devPath)
 	}
 
 	return nil
 }
 
-// getVolumeLetters returns drive letters for volumes on this disk.
-// Uses cached drive letter if available, otherwise queries WMI (faster than PowerShell).
-func (w *diskWriter) getVolumeLetters() ([]string, error) {
-	// Use cached drive letter if available (fastest path)
-	if w.cachedDriveLetter != "" {
-		return []string{w.cachedDriveLetter}, nil
+// lockSingleVolume opens, locks, and dismounts a single volume path.
+func (w *diskWriter) lockSingleVolume(volumePath string) {
+	pathPtr, err := syscall.UTF16PtrFromString(volumePath)
+	if err != nil {
+		return
 	}
 
-	// Use WMI to get volume letters (faster than PowerShell)
-	return getVolumeLettersWMI(w.diskNumber)
-}
-
-// getVolumeLettersWMI queries WMI to find drive letters for a given disk number.
-// This is faster than spawning a PowerShell process.
-func getVolumeLettersWMI(diskNumber int) ([]string, error) {
-	// Query partition associations for this disk
-	type MSFT_PartitionResult struct {
-		DriveLetter uint16
-		DiskNumber  uint32
+	handle, err := windows.CreateFile(
+		pathPtr,
+		windows.GENERIC_READ|windows.GENERIC_WRITE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+		nil,
+		windows.OPEN_EXISTING,
+		0,
+		0,
+	)
+	if err != nil {
+		return
 	}
 
-	// Try Storage WMI first (MSFT_Partition in root\Microsoft\Windows\Storage)
-	var partitions []MSFT_PartitionResult
-	query := fmt.Sprintf("SELECT DriveLetter, DiskNumber FROM MSFT_Partition WHERE DiskNumber = %d", diskNumber)
-	err := wmi.QueryNamespace(query, &partitions, `root\Microsoft\Windows\Storage`)
-	if err == nil && len(partitions) > 0 {
-		var letters []string
-		for _, p := range partitions {
-			if p.DriveLetter > 0 && p.DriveLetter < 256 {
-				letters = append(letters, string(rune(p.DriveLetter)))
-			}
-		}
-		if len(letters) > 0 {
-			return letters, nil
-		}
+	var bytesReturned uint32
+	err = windows.DeviceIoControl(
+		handle,
+		FSCTL_LOCK_VOLUME,
+		nil, 0, nil, 0,
+		&bytesReturned, nil,
+	)
+	if err != nil {
+		windows.CloseHandle(handle)
+		return
 	}
 
-	// Fallback: Use Win32_DiskDrive -> Win32_DiskPartition -> Win32_LogicalDisk associations
-	// This is more complex but works on all Windows versions
-	type DiskPartition struct {
-		DeviceID  string
-		DiskIndex uint32
-	}
+	_ = windows.DeviceIoControl(
+		handle,
+		FSCTL_DISMOUNT_VOLUME,
+		nil, 0, nil, 0,
+		&bytesReturned, nil,
+	)
 
-	type LogicalDiskAssoc struct {
-		Antecedent string
-		Dependent  string
-	}
-
-	// Get partitions for this disk
-	var diskPartitions []DiskPartition
-	partQuery := fmt.Sprintf("SELECT DeviceID, DiskIndex FROM Win32_DiskPartition WHERE DiskIndex = %d", diskNumber)
-	if err := wmi.Query(partQuery, &diskPartitions); err != nil {
-		return nil, nil // Non-fatal: disk might not have partitions
-	}
-
-	if len(diskPartitions) == 0 {
-		return nil, nil
-	}
-
-	// Get logical disk to partition associations
-	var assocs []LogicalDiskAssoc
-	wmi.Query("SELECT Antecedent, Dependent FROM Win32_LogicalDiskToPartition", &assocs)
-
-	// Build map of partition DeviceID to drive letter
-	var letters []string
-	for _, part := range diskPartitions {
-		for _, assoc := range assocs {
-			// Check if this association references our partition
-			if strings.Contains(assoc.Antecedent, part.DeviceID) {
-				// Extract drive letter from Dependent (e.g., "...Win32_LogicalDisk.DeviceID=\"E:\"")
-				idx := strings.Index(assoc.Dependent, `DeviceID="`)
-				if idx != -1 {
-					start := idx + len(`DeviceID="`)
-					end := strings.Index(assoc.Dependent[start:], `"`)
-					if end > 0 {
-						driveLetter := assoc.Dependent[start : start+end]
-						driveLetter = strings.TrimSuffix(driveLetter, ":")
-						if len(driveLetter) == 1 {
-							letters = append(letters, driveLetter)
-						}
-					}
-				}
-			}
-		}
-	}
-
-	return letters, nil
+	w.volumes = append(w.volumes, handle)
 }
 
 // WriteAt writes data at the specified offset (must be aligned to 4096)

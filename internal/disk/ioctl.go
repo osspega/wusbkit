@@ -4,6 +4,7 @@
 package disk
 
 import (
+	"encoding/binary"
 	"fmt"
 	"syscall"
 	"unsafe"
@@ -15,10 +16,10 @@ import (
 const (
 	IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
 	IOCTL_DISK_GET_DRIVE_LAYOUT_EX   = 0x00070050
-	IOCTL_DISK_CREATE_DISK           = 0x0007405C
-	IOCTL_DISK_SET_DRIVE_LAYOUT_EX   = 0x0007C058
-	IOCTL_DISK_UPDATE_PROPERTIES     = 0x00074004
-	IOCTL_DISK_GROW_PARTITION        = 0x0007C054
+	IOCTL_DISK_CREATE_DISK           = 0x0007C058
+	IOCTL_DISK_SET_DRIVE_LAYOUT_EX   = 0x0007C054
+	IOCTL_DISK_UPDATE_PROPERTIES     = 0x00070140
+	IOCTL_DISK_GROW_PARTITION        = 0x0007C0D0
 
 	IOCTL_STORAGE_EJECT_MEDIA = 0x002D4808
 
@@ -50,13 +51,6 @@ const maxPartitions = 128
 // ---------------------------------------------------------------------------
 // Raw Win32 structures (matching Windows SDK layout for DeviceIoControl)
 // ---------------------------------------------------------------------------
-
-// rawCreateDisk maps to the Windows CREATE_DISK structure for MBR disks.
-// The union is simplified to only the MBR member since GPT is not needed here.
-type rawCreateDisk struct {
-	PartitionStyle uint32
-	Signature      uint32
-}
 
 // rawDiskGeometry maps to DISK_GEOMETRY.
 type rawDiskGeometry struct {
@@ -274,17 +268,18 @@ func GetDriveLayout(handle windows.Handle) (*DriveLayout, error) {
 // CreateMBRDisk initializes the disk with a fresh MBR partition table.
 // The signature is a unique 32-bit value identifying the disk.
 func CreateMBRDisk(handle windows.Handle, signature uint32) error {
-	create := rawCreateDisk{
-		PartitionStyle: PARTITION_STYLE_MBR,
-		Signature:      signature,
-	}
-	var bytesReturned uint32
+	// CREATE_DISK: PartitionStyle (4) + union (20) = 24 bytes minimum.
+	// Use raw buffer to guarantee correct size regardless of Go struct layout.
+	var buf [24]byte
+	binary.LittleEndian.PutUint32(buf[0:4], PARTITION_STYLE_MBR)
+	binary.LittleEndian.PutUint32(buf[4:8], signature)
 
+	var bytesReturned uint32
 	err := windows.DeviceIoControl(
 		handle,
 		IOCTL_DISK_CREATE_DISK,
-		(*byte)(unsafe.Pointer(&create)),
-		uint32(unsafe.Sizeof(create)),
+		&buf[0],
+		uint32(len(buf)),
 		nil, 0,
 		&bytesReturned,
 		nil,

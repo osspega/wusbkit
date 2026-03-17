@@ -14,6 +14,7 @@ import (
 
 	"github.com/lazaroagomez/wusbkit/internal/flash"
 	"github.com/lazaroagomez/wusbkit/internal/format"
+	"github.com/lazaroagomez/wusbkit/internal/iso"
 	"github.com/lazaroagomez/wusbkit/internal/lock"
 	"github.com/lazaroagomez/wusbkit/internal/output"
 	"github.com/lazaroagomez/wusbkit/internal/parallel"
@@ -33,6 +34,7 @@ var (
 	flashForce          bool
 	flashParallel       bool
 	flashMaxConcurrent  int
+	flashExtract        bool
 )
 
 var flashCmd = &cobra.Command{
@@ -51,7 +53,12 @@ Supported image sources:
   - Local files: .img, .iso, .bin, .raw
   - Compressed: .gz, .xz, .zst/.zstd (streaming decompression)
   - Archives: .zip (streams first image file inside)
-  - Remote URLs: HTTP/HTTPS URLs (streams directly without downloading)`,
+  - Remote URLs: HTTP/HTTPS URLs (streams directly without downloading)
+
+Windows ISO mode (--extract or auto-detected):
+  When the image is a Windows ISO, the drive is partitioned, formatted,
+  and the ISO contents are extracted (file copy). This produces a bootable
+  Windows USB, unlike raw DD mode.`,
 	Example: `  wusbkit flash 2 --image ubuntu.img
   wusbkit flash E: --image raspios.img.xz --verify
   wusbkit flash 2 --image debian.iso --yes --json
@@ -74,6 +81,7 @@ func init() {
 	flashCmd.Flags().BoolVar(&flashForce, "force", false, "Override safety protections (system disk, size limits)")
 	flashCmd.Flags().BoolVar(&flashParallel, "parallel", false, "Flash same image to multiple disks in parallel")
 	flashCmd.Flags().IntVar(&flashMaxConcurrent, "max-concurrent", 0, "Max concurrent operations (0=unlimited)")
+	flashCmd.Flags().BoolVar(&flashExtract, "extract", false, "Extract ISO contents instead of raw write (auto-detected for Windows ISOs)")
 	flashCmd.MarkFlagRequired("image")
 	rootCmd.AddCommand(flashCmd)
 }
@@ -325,6 +333,22 @@ func runSingleFlash(cmd *cobra.Command, args []string) error {
 		return errors.New(errMsg)
 	}
 
+	// Auto-detect extract mode for Windows ISOs
+	useExtract := flashExtract
+	if !useExtract && !isURL && strings.HasSuffix(strings.ToLower(flashImage), ".iso") {
+		if iso.IsWindowsISO(flashImage) {
+			useExtract = true
+			if !jsonOutput {
+				pterm.Info.Println("Windows ISO detected — using extract mode (partition + format + file copy)")
+			}
+		}
+	}
+
+	// Extract mode: use ISO pipeline instead of raw flasher
+	if useExtract {
+		return runExtractFlash(ctx, device.DiskNumber, flashImage)
+	}
+
 	// Prepare flash options
 	opts := flash.Options{
 		DiskNumber:    device.DiskNumber,
@@ -388,6 +412,47 @@ func runSingleFlash(cmd *cobra.Command, args []string) error {
 	}
 
 	// Wait for flash to complete
+	if err := <-errChan; err != nil {
+		if !jsonOutput && err != context.Canceled {
+			PrintError(err.Error(), output.ErrCodeFlashFailed)
+		}
+		return err
+	}
+
+	return nil
+}
+
+// runExtractFlash uses the ISO pipeline to partition, format, and extract ISO contents.
+func runExtractFlash(ctx context.Context, diskNumber int, isoPath string) error {
+	writer := iso.NewWriter()
+
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- writer.Write(ctx, iso.WriteOptions{
+			DiskNumber: diskNumber,
+			ISOPath:    isoPath,
+		})
+	}()
+
+	if jsonOutput {
+		for p := range writer.Progress() {
+			data, _ := json.Marshal(p)
+			fmt.Println(string(data))
+		}
+	} else {
+		spinner, _ := pterm.DefaultSpinner.Start("Preparing ISO extract...")
+
+		for p := range writer.Progress() {
+			if p.Error != "" {
+				spinner.Fail(p.Error)
+			} else if p.Percentage >= 100 {
+				spinner.Success("ISO written successfully!")
+			} else {
+				spinner.UpdateText(fmt.Sprintf("[%s] %d%% — %s", p.Stage, p.Percentage, p.Status))
+			}
+		}
+	}
+
 	if err := <-errChan; err != nil {
 		if !jsonOutput && err != context.Canceled {
 			PrintError(err.Error(), output.ErrCodeFlashFailed)
