@@ -1,0 +1,14 @@
+# Wails build output
+build/bin/
+build/appicon.png
+
+# Frontend build artifacts
+frontend/dist/
+frontend/node_modules/
+frontend/wailsjs/
+frontend/package.json.md5
+frontend/package-lock.json
+
+# Wails auto-generated
+build/windows/icon.ico
+build/windows/info.json
